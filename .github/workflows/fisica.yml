@@ -37,6 +37,8 @@ jobs:
         working-directory: source/buildscripts
         run: |
           set -o pipefail
+          # Andiweli trabaja en Windows: en git los .sh no tienen permiso de ejecucion
+          find . -name '*.sh' -exec chmod +x {} +
           ./build.sh --arch arm64 --jobs 4 2>&1 | tee compilacion.log
 
       - name: Errores de la compilacion
