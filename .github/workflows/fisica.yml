@@ -1,0 +1,87 @@
+name: OpenMW Fisica (APK arm64)
+
+# Compila el motor OpenMW 0.51 de Andiweli + Modern Physics portado (ragdolls) y lo mete
+# en el APK oficial 0.51.0-14 de Andiweli, como app aparte ("OpenMW Física").
+on:
+  push:
+    branches: [fisica]
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Liberar espacio en disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift \
+            /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk/ndk /usr/local/share/boost || true
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Dependencias del sistema
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential gcc-multilib g++-multilib python3 unzip zip curl wget \
+            pkg-config gettext-base autoconf automake libtool p7zip-full nasm yasm m4 bison flex
+
+      - name: Descargas en cache (NDK y fuentes)
+        uses: actions/cache@v4
+        with:
+          path: source/buildscripts/downloads
+          key: descargas-${{ hashFiles('source/buildscripts/CMakeLists.txt', 'source/buildscripts/include/version.sh') }}
+          restore-keys: descargas-
+
+      - name: Compilar motor (arm64, puede tardar 1-3 h)
+        working-directory: source/buildscripts
+        run: |
+          set -o pipefail
+          ./build.sh --arch arm64 --jobs 4 2>&1 | tee compilacion.log
+
+      - name: Errores de la compilacion
+        if: failure()
+        working-directory: source/buildscripts
+        run: |
+          grep -n -E -i '(fatal error:|error:|cmake error|undefined reference|FAILED:|\*\*\*)' compilacion.log | tail -n 150 || true
+
+      - name: Comprobar que el motor trae la fisica
+        run: |
+          SO=source/app/src/main/jniLibs/arm64-v8a/libopenmw.so
+          ls -la "$SO"
+          strings "$SO" | grep -c -i ragdoll
+          strings "$SO" | grep -q 'Modern Physics' && echo "Ajustes de Modern Physics presentes" || true
+
+      - name: Bajar el APK oficial de Andiweli (0.51.0-14)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p base
+          gh release view 0.51.0-14 --repo Andiweli/OpenMW-Android || true
+          gh release download 0.51.0-14 --repo Andiweli/OpenMW-Android --pattern '*.apk' --dir base
+          ls -la base
+          APK=$(ls base/*.apk | grep -v -i -E 'automotive|aaos' | head -n1)
+          echo "BASE_APK=$APK" >> "$GITHUB_ENV"
+
+      - name: Reempaquetar y firmar
+        run: |
+          bash source/fisica/reempaquetar.sh "$BASE_APK" source/app/src/main/jniLibs/arm64-v8a \
+            source/app/src/main/assets/libopenmw "OpenMW_Fisica_0.51.0-14.apk"
+
+      - name: Subir el APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenMW_Fisica_APK
+          path: OpenMW_Fisica_0.51.0-14.apk
+          retention-days: 30
+
+      - name: Subir simbolos (para leer cierres del juego)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simbolos_y_log
+          path: |
+            source/buildscripts/symbols/arm64-v8a/libopenmw.so
+            source/buildscripts/compilacion.log
+          retention-days: 14
+          if-no-files-found: ignore
