@@ -7,6 +7,9 @@ on:
     branches: [fisica]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   apk:
     runs-on: ubuntu-24.04
@@ -76,6 +79,15 @@ jobs:
           name: OpenMW_Fisica_APK
           path: OpenMW_Fisica_0.51.0-14.apk
           retention-days: 30
+
+      - name: Publicar en Releases (descarga directa del APK)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="fisica-${{ github.run_number }}"
+          gh release create "$TAG" OpenMW_Fisica_0.51.0-14.apk --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" --title "OpenMW Física (compilación ${{ github.run_number }})" \
+            --notes "Motor OpenMW 0.51 (Andiweli 0.51.0-14) + Modern Physics portado. Se instala aparte de OpenMW."
 
       - name: Subir simbolos (para leer cierres del juego)
         if: always()
