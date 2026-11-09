@@ -431,8 +431,39 @@ index 0bd1f9e6f..a6f29770d 100644
  
                  { "ZoomIn", MWInput::A_ZoomIn },
                  { "ZoomOut", MWInput::A_ZoomOut },
+diff --git a/apps/openmw/mwlua/types/actor.cpp b/apps/openmw/mwlua/types/actor.cpp
+index 270f6e1e4..769695877 100644
+--- a/apps/openmw/mwlua/types/actor.cpp
++++ b/apps/openmw/mwlua/types/actor.cpp
+@@ -442,6 +442,26 @@ namespace MWLua
+                 "SetBarterGoldAction");
+         };
+ 
++        // Fisica (0.51 Android): same as world.startRagdoll, from a local script on self.
++        actor["startRagdoll"] = [context](const Object& object, sol::optional<osg::Vec3f> kick) {
++            if (!object.isGObject() && !object.isSelfObject())
++                throw std::runtime_error("Can only be used in global scripts or in local scripts on self.");
++            const osg::Vec3f k = kick.value_or(osg::Vec3f());
++            context.mLuaManager->addAction(
++                [obj = Object(object), k] {
++                    const MWWorld::Ptr ptr = obj.ptr();
++                    if (!ptr.getClass().getCreatureStats(ptr).isDead())
++                        return;
++                    MWBase::World* world = MWBase::Environment::get().getWorld();
++                    if (world->getRagdollBonePoses(ptr).empty())
++                        world->makeRagdoll(ptr, k, true, false);
++                },
++                "startRagdoll");
++        };
++        actor["hasRagdoll"] = [](const Object& object) {
++            return !MWBase::Environment::get().getWorld()->getRagdollBonePoses(object.ptr()).empty();
++        };
++
+         actor["_onHit"] = [context](const SelfObject& self, const sol::table& options) {
+             sol::optional<sol::table> damageLua = options.get<sol::optional<sol::table>>("damage");
+             std::map<std::string, float> damageCpp;
 diff --git a/apps/openmw/mwlua/worldbindings.cpp b/apps/openmw/mwlua/worldbindings.cpp
-index 531460423..de70396cf 100644
+index 531460423..955e16d34 100644
 --- a/apps/openmw/mwlua/worldbindings.cpp
 +++ b/apps/openmw/mwlua/worldbindings.cpp
 @@ -24,11 +24,17 @@
@@ -453,7 +484,7 @@ index 531460423..de70396cf 100644
  #include "../mwworld/store.hpp"
  #include "../mwworld/worldmodel.hpp"
  
-@@ -253,6 +259,110 @@ namespace MWLua
+@@ -253,6 +259,128 @@ namespace MWLua
                  return MWBase::Environment::get().getESMStore()->insert(light);
              });
  
@@ -478,6 +509,24 @@ index 531460423..de70396cf 100644
 +                "_releaseGrabbedObject");
 +        };
 +        api["_isGrabbingObject"] = []() { return MWBase::Environment::get().getWorld()->isGrabbingObject(); };
++        // Fisica (0.51 Android): a mod that held a body in its own animation (a killmove, say) lets it go limp from
++        // the pose it is in now. Only dead actors; the character controller takes the new ragdoll over by itself.
++        api["startRagdoll"] = [context](const GObject& actor, sol::optional<osg::Vec3f> kick) {
++            const osg::Vec3f k = kick.value_or(osg::Vec3f());
++            context.mLuaManager->addAction(
++                [actor, k] {
++                    const MWWorld::Ptr ptr = actor.ptr();
++                    if (!ptr.getClass().isActor() || !ptr.getClass().getCreatureStats(ptr).isDead())
++                        return;
++                    MWBase::World* world = MWBase::Environment::get().getWorld();
++                    if (world->getRagdollBonePoses(ptr).empty())
++                        world->makeRagdoll(ptr, k, true, false);
++                },
++                "startRagdoll");
++        };
++        api["hasRagdoll"] = [](const GObject& actor) {
++            return !MWBase::Environment::get().getWorld()->getRagdollBonePoses(actor.ptr()).empty();
++        };
 +        api["_ragdollBoneCount"] = [](const GObject& actor) {
 +            return MWBase::Environment::get().getWorld()->getRagdollBonePoses(actor.ptr()).size();
 +        };
