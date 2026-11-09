@@ -432,10 +432,10 @@ index 0bd1f9e6f..a6f29770d 100644
                  { "ZoomIn", MWInput::A_ZoomIn },
                  { "ZoomOut", MWInput::A_ZoomOut },
 diff --git a/apps/openmw/mwlua/types/actor.cpp b/apps/openmw/mwlua/types/actor.cpp
-index 270f6e1e4..769695877 100644
+index 270f6e1e4..85456bc53 100644
 --- a/apps/openmw/mwlua/types/actor.cpp
 +++ b/apps/openmw/mwlua/types/actor.cpp
-@@ -442,6 +442,26 @@ namespace MWLua
+@@ -442,6 +442,29 @@ namespace MWLua
                  "SetBarterGoldAction");
          };
  
@@ -444,14 +444,17 @@ index 270f6e1e4..769695877 100644
 +            if (!object.isGObject() && !object.isSelfObject())
 +                throw std::runtime_error("Can only be used in global scripts or in local scripts on self.");
 +            const osg::Vec3f k = kick.value_or(osg::Vec3f());
++            const bool kicked = kick.has_value();
 +            context.mLuaManager->addAction(
-+                [obj = Object(object), k] {
++                [obj = Object(object), k, kicked] {
 +                    const MWWorld::Ptr ptr = obj.ptr();
 +                    if (!ptr.getClass().getCreatureStats(ptr).isDead())
 +                        return;
 +                    MWBase::World* world = MWBase::Environment::get().getWorld();
 +                    if (world->getRagdollBonePoses(ptr).empty())
-+                        world->makeRagdoll(ptr, k, true, false);
++                        // Without a kick it is a body already lying (the end of a killmove): made at rest, like one
++                        // loaded from a save, so parts touching the ground don't throw it apart. With a kick, it falls.
++                        world->makeRagdoll(ptr, k, true, !kicked);
 +                },
 +                "startRagdoll");
 +        };
@@ -463,7 +466,7 @@ index 270f6e1e4..769695877 100644
              sol::optional<sol::table> damageLua = options.get<sol::optional<sol::table>>("damage");
              std::map<std::string, float> damageCpp;
 diff --git a/apps/openmw/mwlua/worldbindings.cpp b/apps/openmw/mwlua/worldbindings.cpp
-index 531460423..955e16d34 100644
+index 531460423..d28a46de9 100644
 --- a/apps/openmw/mwlua/worldbindings.cpp
 +++ b/apps/openmw/mwlua/worldbindings.cpp
 @@ -24,11 +24,17 @@
@@ -484,7 +487,7 @@ index 531460423..955e16d34 100644
  #include "../mwworld/store.hpp"
  #include "../mwworld/worldmodel.hpp"
  
-@@ -253,6 +259,128 @@ namespace MWLua
+@@ -253,6 +259,131 @@ namespace MWLua
                  return MWBase::Environment::get().getESMStore()->insert(light);
              });
  
@@ -513,14 +516,17 @@ index 531460423..955e16d34 100644
 +        // the pose it is in now. Only dead actors; the character controller takes the new ragdoll over by itself.
 +        api["startRagdoll"] = [context](const GObject& actor, sol::optional<osg::Vec3f> kick) {
 +            const osg::Vec3f k = kick.value_or(osg::Vec3f());
++            const bool kicked = kick.has_value();
 +            context.mLuaManager->addAction(
-+                [actor, k] {
++                [actor, k, kicked] {
 +                    const MWWorld::Ptr ptr = actor.ptr();
 +                    if (!ptr.getClass().isActor() || !ptr.getClass().getCreatureStats(ptr).isDead())
 +                        return;
 +                    MWBase::World* world = MWBase::Environment::get().getWorld();
 +                    if (world->getRagdollBonePoses(ptr).empty())
-+                        world->makeRagdoll(ptr, k, true, false);
++                        // Without a kick it is a body already lying (the end of a killmove): made at rest, like one
++                        // loaded from a save, so parts touching the ground don't throw it apart. With a kick, it falls.
++                        world->makeRagdoll(ptr, k, true, !kicked);
 +                },
 +                "startRagdoll");
 +        };
