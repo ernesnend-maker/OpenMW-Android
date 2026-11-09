@@ -1,0 +1,41 @@
+name: Traer juego de prueba (example-suite)
+
+# Rama auxiliar: descarga el juego de prueba libre de OpenMW (example-suite, GitLab, con LFS) y guarda aqui
+# sus archivos de datos pequenos, para poder probar el motor con fisica sin Morrowind.
+on:
+  push:
+    branches: [banco-pruebas]
+    paths: ['.github/workflows/traer-juego-prueba.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  traer:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Descargar example-suite
+        run: |
+          git lfs install
+          git clone --depth 1 https://gitlab.com/OpenMW/example-suite.git /tmp/es
+          cd /tmp/es && git lfs pull && git log -1 --format='%H %ci' && du -sh .
+          find . -name '*.omwgame' -o -name '*.omwaddon' | xargs ls -la
+      - name: Guardar los datos en esta rama
+        run: |
+          mkdir -p datos
+          cd /tmp/es
+          # contenido (pequeno) + texturas del personaje y del suelo; sin .blend ni musica
+          find . -type f \( -name '*.omwgame' -o -name '*.omwaddon' -o -name '*.omwscripts' -o -name '*.cfg' \
+              -o -name '*.lua' -o -name '*.yaml' -o -name '*.txt' \) -not -path './.git/*' \
+              -exec cp --parents {} "$GITHUB_WORKSPACE/datos/" \;
+          find game_template/data -type f \( -name '*.png' -o -name '*.dds' \) -size -600k \
+              -exec cp --parents {} "$GITHUB_WORKSPACE/datos/" \;
+          cd "$GITHUB_WORKSPACE"
+          du -sh datos; find datos -type f | wc -l
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add datos
+          git commit -q -m "Datos del juego de prueba (example-suite) [skip ci]" || echo "sin cambios"
+          git push origin HEAD:banco-pruebas
