@@ -82,7 +82,7 @@ index 9b6b579c2..bd1f18e2c 100644
          ///< Stop the given sound from playing
  
 diff --git a/apps/openmw/mwbase/world.hpp b/apps/openmw/mwbase/world.hpp
-index 819c4ac91..564eb92fe 100644
+index 819c4ac91..96fba3c1e 100644
 --- a/apps/openmw/mwbase/world.hpp
 +++ b/apps/openmw/mwbase/world.hpp
 @@ -6,9 +6,13 @@
@@ -99,7 +99,7 @@ index 819c4ac91..564eb92fe 100644
  #include <components/misc/rng.hpp>
  #include <components/vfs/pathutil.hpp>
  
-@@ -287,6 +291,43 @@ namespace MWBase
+@@ -287,6 +291,48 @@ namespace MWBase
  
          virtual void scaleObject(const MWWorld::Ptr& ptr, float scale, bool force = false) = 0;
  
@@ -125,6 +125,11 @@ index 819c4ac91..564eb92fe 100644
 +            const MWWorld::Ptr& actor, const osg::Vec3f& kick, bool allowOnePiece, bool atRest)
 +            = 0;
 +        virtual void removeRagdoll(const MWWorld::ConstPtr& actor) = 0;
++        /// Fisica (Delirium): a living actor thrown down (a hard hit): a jointed ragdoll whose muscles fade from
++        /// tone to toneEnd over seconds. @return false if it can't have one (no skeleton, or in one piece).
++        virtual bool makeLiveRagdoll(
++            const MWWorld::Ptr& actor, const osg::Vec3f& kick, float tone, float toneEnd, float seconds)
++            = 0;
 +
 +        /// A simulated object fell into water here, going down at speed: ripples, and a splash if fast.
 +        virtual void objectEnteredWater(const MWWorld::Ptr& object, const osg::Vec3f& position, float speed) = 0;
@@ -144,7 +149,7 @@ index 819c4ac91..564eb92fe 100644
              const MWWorld::Ptr& ptr, const osg::Vec3f& rot, RotationFlags flags = RotationFlag_inverseOrder)
              = 0;
 diff --git a/apps/openmw/mwclass/creature.cpp b/apps/openmw/mwclass/creature.cpp
-index 7effead29..b9608e17c 100644
+index 7effead29..55203e259 100644
 --- a/apps/openmw/mwclass/creature.cpp
 +++ b/apps/openmw/mwclass/creature.cpp
 @@ -274,8 +274,11 @@ namespace MWClass
@@ -170,10 +175,27 @@ index 7effead29..b9608e17c 100644
          if (!successful)
          {
              // Missed
-@@ -454,6 +459,18 @@ namespace MWClass
+@@ -454,6 +459,35 @@ namespace MWClass
                      stats.setHitRecovery(true); // Is this supposed to always occur?
              }
          }
++
++        // Fisica: Delirium takes the hit (how hard, from where) in the character controller.
++        if (hasHealthDamage && healthDamage > 0.0f && !stats.isDead())
++        {
++            MWMechanics::DeliriumHit hit;
++            if (!attacker.isEmpty())
++            {
++                hit.mAway = ptr.getRefData().getPosition().asVec3() - attacker.getRefData().getPosition().asVec3();
++                hit.mAway.z() = 0;
++                if (hit.mAway.normalize() <= 0)
++                    hit.mAway = osg::Vec3f();
++            }
++            const float maxHealth = std::max(1.f, stats.getHealth().getModified());
++            hit.mStrength = healthDamage / maxHealth;
++            hit.mPending = true;
++            stats.setDeliriumHit(hit);
++        }
 +
 +        // The killing blow throws the body (its ragdoll, for those with one) away from the attacker, as for NPCs.
 +        if (wasAlive && stats.isDead() && !attacker.isEmpty() && hasHealthDamage && healthDamage >= 0.001f)
@@ -206,7 +228,7 @@ index 11867daa4..91a77f9cb 100644
  
      bool Light::useAnim() const
 diff --git a/apps/openmw/mwclass/npc.cpp b/apps/openmw/mwclass/npc.cpp
-index f842c5215..be58c7869 100644
+index f842c5215..24e7fb75e 100644
 --- a/apps/openmw/mwclass/npc.cpp
 +++ b/apps/openmw/mwclass/npc.cpp
 @@ -613,8 +613,11 @@ namespace MWClass
@@ -222,8 +244,27 @@ index f842c5215..be58c7869 100644
  
          const MWWorld::Class& othercls = victim.getClass();
          MWMechanics::CreatureStats& otherstats = othercls.getCreatureStats(victim);
-@@ -830,6 +833,20 @@ namespace MWClass
+@@ -828,8 +831,39 @@ namespace MWClass
+                 MWBase::Environment::get().getWindowManager()->activateHitOverlay();
+         }
  
++        // Fisica: Delirium takes the hit (how hard, from where) in the character controller.
++        if (hasHealthDamage && healthDamage > 0.0f && !stats.isDead())
++        {
++            MWMechanics::DeliriumHit hit;
++            if (!attacker.isEmpty())
++            {
++                hit.mAway = ptr.getRefData().getPosition().asVec3() - attacker.getRefData().getPosition().asVec3();
++                hit.mAway.z() = 0;
++                if (hit.mAway.normalize() <= 0)
++                    hit.mAway = osg::Vec3f();
++            }
++            const float maxHealth = std::max(1.f, stats.getHealth().getModified());
++            hit.mStrength = healthDamage / maxHealth;
++            hit.mPending = true;
++            stats.setDeliriumHit(hit);
++        }
++
          if (!wasDead && getCreatureStats(ptr).isDead())
          {
 +            // The killing blow throws the body (its ragdoll) away from the attacker, harder for heavier blows,
@@ -432,10 +473,10 @@ index 0bd1f9e6f..a6f29770d 100644
                  { "ZoomIn", MWInput::A_ZoomIn },
                  { "ZoomOut", MWInput::A_ZoomOut },
 diff --git a/apps/openmw/mwlua/types/actor.cpp b/apps/openmw/mwlua/types/actor.cpp
-index 270f6e1e4..85456bc53 100644
+index 270f6e1e4..b64853c1e 100644
 --- a/apps/openmw/mwlua/types/actor.cpp
 +++ b/apps/openmw/mwlua/types/actor.cpp
-@@ -442,6 +442,29 @@ namespace MWLua
+@@ -442,6 +442,36 @@ namespace MWLua
                  "SetBarterGoldAction");
          };
  
@@ -458,6 +499,13 @@ index 270f6e1e4..85456bc53 100644
 +                },
 +                "startRagdoll");
 +        };
++        // Fisica: no Delirium for this actor while a mod holds it (a killmove, say).
++        actor["setDeliriumBlocked"] = [](const Object& object, bool blocked) {
++            if (!object.isGObject() && !object.isSelfObject())
++                throw std::runtime_error("Can only be used in global scripts or in local scripts on self.");
++            const MWWorld::Ptr ptr = object.ptr();
++            ptr.getClass().getCreatureStats(ptr).setDeliriumBlocked(blocked);
++        };
 +        actor["hasRagdoll"] = [](const Object& object) {
 +            return !MWBase::Environment::get().getWorld()->getRagdollBonePoses(object.ptr()).empty();
 +        };
@@ -466,7 +514,7 @@ index 270f6e1e4..85456bc53 100644
              sol::optional<sol::table> damageLua = options.get<sol::optional<sol::table>>("damage");
              std::map<std::string, float> damageCpp;
 diff --git a/apps/openmw/mwlua/worldbindings.cpp b/apps/openmw/mwlua/worldbindings.cpp
-index 531460423..d28a46de9 100644
+index 531460423..33baf2579 100644
 --- a/apps/openmw/mwlua/worldbindings.cpp
 +++ b/apps/openmw/mwlua/worldbindings.cpp
 @@ -24,11 +24,17 @@
@@ -487,7 +535,7 @@ index 531460423..d28a46de9 100644
  #include "../mwworld/store.hpp"
  #include "../mwworld/worldmodel.hpp"
  
-@@ -253,6 +259,131 @@ namespace MWLua
+@@ -253,6 +259,142 @@ namespace MWLua
                  return MWBase::Environment::get().getESMStore()->insert(light);
              });
  
@@ -529,6 +577,17 @@ index 531460423..d28a46de9 100644
 +                        world->makeRagdoll(ptr, k, true, !kicked);
 +                },
 +                "startRagdoll");
++        };
++        // Fisica: Delirium's options (see mwmechanics/delirium.hpp); fields left out keep their value.
++        api["setDelirium"] = [](const sol::table& options) {
++            MWMechanics::DeliriumConfig& cfg = MWMechanics::deliriumConfig();
++            cfg.mEnabled = options.get_or("enabled", cfg.mEnabled);
++            cfg.mIntensity = std::clamp(options.get_or("intensity", cfg.mIntensity), 0.f, 3.f);
++            cfg.mFallThreshold = std::clamp(options.get_or("fallThreshold", cfg.mFallThreshold), 0.f, 2.f);
++            cfg.mCreatures = options.get_or("creatures", cfg.mCreatures);
++            cfg.mReplaceHits = options.get_or("replaceHits", cfg.mReplaceHits);
++            cfg.mKnockdowns = options.get_or("knockdowns", cfg.mKnockdowns);
++            cfg.mGetUpTime = std::clamp(options.get_or("getUpTime", cfg.mGetUpTime), 0.3f, 10.f);
 +        };
 +        api["hasRagdoll"] = [](const GObject& actor) {
 +            return !MWBase::Environment::get().getWorld()->getRagdollBonePoses(actor.ptr()).empty();
@@ -620,7 +679,7 @@ index 531460423..d28a46de9 100644
              if (!object.ptr().getRefData().activate())
                  return;
 diff --git a/apps/openmw/mwmechanics/actors.cpp b/apps/openmw/mwmechanics/actors.cpp
-index 61a148b7e..382a1433c 100644
+index 61a148b7e..e778a172d 100644
 --- a/apps/openmw/mwmechanics/actors.cpp
 +++ b/apps/openmw/mwmechanics/actors.cpp
 @@ -51,6 +51,7 @@
@@ -642,7 +701,17 @@ index 61a148b7e..382a1433c 100644
                  stats.setAttackType(attackTypeName(controls.mUse));
  
                  controls.mChanged = false;
-@@ -1711,6 +1714,7 @@ namespace MWMechanics
+@@ -1702,7 +1705,8 @@ namespace MWMechanics
+ 
+                 actor.getPtr().getRefData().getBaseNode()->setNodeMask(MWRender::Mask_Actor);
+                 world->setActorCollisionMode(actor.getPtr(), true,
+-                    !actor.getPtr().getClass().getCreatureStats(actor.getPtr()).isDeathAnimationFinished());
++                    !actor.getPtr().getClass().getCreatureStats(actor.getPtr()).isDeathAnimationFinished()
++                        && !ctrl.isLiveRagdoll()); // Fisica (Delirium): thrown down, its ragdoll is its body
+ 
+                 if (!actor.getPositionAdjusted())
+                 {
+@@ -1711,6 +1715,7 @@ namespace MWMechanics
                  }
  
                  ctrl.update(duration);
@@ -650,7 +719,7 @@ index 61a148b7e..382a1433c 100644
  
                  updateVisibility(actor.getPtr(), ctrl);
              }
-@@ -1760,6 +1764,8 @@ namespace MWMechanics
+@@ -1760,6 +1765,8 @@ namespace MWMechanics
      void Actors::notifyDied(const MWWorld::Ptr& actor)
      {
          actor.getClass().getCreatureStats(actor).notifyDied();
@@ -660,10 +729,64 @@ index 61a148b7e..382a1433c 100644
          ++mDeathCount[actor.getCellRef().getRefId()];
  
 diff --git a/apps/openmw/mwmechanics/character.cpp b/apps/openmw/mwmechanics/character.cpp
-index 664f293fb..982fbc38f 100644
+index 664f293fb..0f606137c 100644
 --- a/apps/openmw/mwmechanics/character.cpp
 +++ b/apps/openmw/mwmechanics/character.cpp
-@@ -895,6 +895,26 @@ namespace MWMechanics
+@@ -51,6 +51,7 @@
+ #include "actorutil.hpp"
+ #include "aicombataction.hpp"
+ #include "creaturestats.hpp"
++#include "delirium.hpp"
+ #include "movement.hpp"
+ #include "npcstats.hpp"
+ #include "security.hpp"
+@@ -395,6 +396,45 @@ namespace MWMechanics
+         bool block = stats.getBlock() && !knockout && !recovery && !knockdown;
+         bool isSwimming = world->isSwimming(mPtr);
+ 
++        // Fisica (Delirium): a hard hit (or a knockdown) throws the body into a ragdoll; a light one bends it.
++        if (deliriumEligible())
++        {
++            const DeliriumConfig& cfg = deliriumConfig();
++            DeliriumHit hit;
++            const bool hasHit = stats.takeDeliriumHit(hit);
++            const bool alreadyDown = mHitState == CharState_KnockDown || mHitState == CharState_KnockOut
++                || mHitState == CharState_SwimKnockDown || mHitState == CharState_SwimKnockOut;
++            bool fall = cfg.mKnockdowns && (knockdown || knockout) && !alreadyDown;
++            if (hasHit && !fall && cfg.mFallThreshold > 0)
++            {
++                const float roll = 0.8f + 0.4f * Misc::Rng::rollProbability(world->getPrng());
++                fall = hit.mStrength >= cfg.mFallThreshold * roll;
++            }
++            if (fall && !alreadyDown && canFallDown())
++            {
++                osg::Vec3f kick = hit.mAway * std::clamp(150.f + 900.f * hit.mStrength, 150.f, 450.f);
++                kick.z() = 40.f;
++                if (startLiveRagdoll(kick))
++                    return;
++            }
++            if (hasHit)
++            {
++                osg::Vec3f away = hit.mAway;
++                if (away.length2() < 0.01f)
++                    away = osg::Quat(mPtr.getRefData().getPosition().rot[2], osg::Vec3f(0, 0, -1))
++                        * osg::Vec3f(0, -1, 0); // no attacker: backwards
++                const osg::Vec3f local = osg::Quat(mPtr.getRefData().getPosition().rot[2], osg::Vec3f(0, 0, 1)) * away;
++                const float speed = (2.5f + 10.f * std::min(hit.mStrength, 0.5f)) * cfg.mIntensity;
++                mFlinchSpeed += osg::Vec2f(local.x(), local.y()) * speed;
++                mFlinching = true;
++                if (cfg.mReplaceHits && recovery && !knockdown && !knockout)
++                {
++                    stats.setHitRecovery(false);
++                    recovery = false;
++                }
++            }
++        }
++
+         stats.setBlock(false);
+ 
+         if (mPtr == getPlayer() && mHitState == CharState_Block && block)
+@@ -895,6 +935,26 @@ namespace MWMechanics
          if (!mAnimation || isScriptedAnimPlaying())
              return;
  
@@ -690,7 +813,16 @@ index 664f293fb..982fbc38f 100644
          playDeath(startpoint, mDeathState);
      }
  
-@@ -2437,6 +2457,15 @@ namespace MWMechanics
+@@ -1996,6 +2056,8 @@ namespace MWMechanics
+ 
+         if (!cls.isActor())
+             updateAnimQueue();
++        else if (mLiveRagdoll && !cls.getCreatureStats(mPtr).isDead())
++            updateLiveRagdoll(duration); // Fisica (Delirium): down, the ragdoll drives the bones
+         else if (!cls.getCreatureStats(mPtr).isDead())
+         {
+             bool onground = world->isOnGround(mPtr);
+@@ -2437,6 +2499,15 @@ namespace MWMechanics
          }
          else if (cls.getCreatureStats(mPtr).isDead())
          {
@@ -706,7 +838,26 @@ index 664f293fb..982fbc38f 100644
              // initial start of death animation for actors that started the game as dead
              // not done in constructor since we need to give scripts a chance to set the mSkipAnim flag
              if (!mSkipAnim && mDeathState != CharState_None && mCurrentDeath.empty())
-@@ -2780,7 +2809,9 @@ namespace MWMechanics
+@@ -2447,6 +2518,18 @@ namespace MWMechanics
+             }
+         }
+ 
++        if (mFlinching)
++        {
++            if (cls.isActor() && !cls.getCreatureStats(mPtr).isDead() && !mLiveRagdoll)
++                updateFlinch(duration);
++            else
++            {
++                mFlinchAngle = mFlinchSpeed = osg::Vec2f();
++                mFlinching = false;
++                mAnimation->setFlinch(osg::Quat());
++            }
++        }
++
+         osg::Vec3f movementFromAnimation
+             = mAnimation->runAnimation(mSkipAnim && !isScriptedAnimPlaying() ? 0.f : duration);
+ 
+@@ -2780,7 +2863,9 @@ namespace MWMechanics
      {
          if (mDeathState == CharState_None)
          {
@@ -716,7 +867,7 @@ index 664f293fb..982fbc38f 100644
              resetCurrentIdleState();
              return Result_DeathAnimStarted;
          }
-@@ -2798,6 +2829,13 @@ namespace MWMechanics
+@@ -2798,6 +2883,13 @@ namespace MWMechanics
  
      void CharacterController::resurrect()
      {
@@ -730,7 +881,7 @@ index 664f293fb..982fbc38f 100644
          if (mDeathState == CharState_None)
              return;
  
-@@ -2805,6 +2843,90 @@ namespace MWMechanics
+@@ -2805,6 +2897,255 @@ namespace MWMechanics
          mWeaponType = ESM::Weapon::None;
      }
  
@@ -739,6 +890,18 @@ index 664f293fb..982fbc38f 100644
 +        // Anyone with a skeleton; the rest play their death animation. Not the player (the death camera).
 +        if (!mAnimation || mPtr == getPlayer())
 +            return false;
++        if (mLiveRagdoll)
++        {
++            // Dies while down (Delirium): the same ragdoll goes on, now limp.
++            mLiveRagdoll = false;
++            MWBase::World* world = MWBase::Environment::get().getWorld();
++            world->setActorCollisionMode(mPtr, true, true);
++            if (world->makeLiveRagdoll(mPtr, osg::Vec3f(), 0.f, 0.f, 0.f) || !world->getRagdollBonePoses(mPtr).empty())
++            {
++                mRagdoll = true;
++                return true;
++            }
++        }
 +        CreatureStats& stats = mPtr.getClass().getCreatureStats(mPtr);
 +        const osg::Vec3f kick = stats.getDeathKick();
 +        stats.setDeathKick(osg::Vec3f());
@@ -746,6 +909,159 @@ index 664f293fb..982fbc38f 100644
 +            return false;
 +        mRagdoll = true;
 +        return true;
++    }
++
++    bool CharacterController::deliriumEligible() const
++    {
++        const DeliriumConfig& cfg = deliriumConfig();
++        if (!cfg.mEnabled || mAnimation == nullptr || mPtr == getPlayer() || !mPtr.getClass().isActor())
++            return false;
++        if (!mPtr.getClass().isNpc() && !cfg.mCreatures)
++            return false;
++        const CreatureStats& stats = mPtr.getClass().getCreatureStats(mPtr);
++        return !stats.isDead() && !stats.isDeliriumBlocked() && !isScriptedAnimPlaying();
++    }
++
++    bool CharacterController::canFallDown() const
++    {
++        MWBase::World* world = MWBase::Environment::get().getWorld();
++        return mAnimation->hasAnimation("knockdown") && world->isOnGround(mPtr) && !world->isSwimming(mPtr)
++            && !world->isFlying(mPtr);
++    }
++
++    bool CharacterController::startLiveRagdoll(const osg::Vec3f& kick)
++    {
++        MWBase::World* world = MWBase::Environment::get().getWorld();
++        // Muscles: it braces a moment, then gives (it doesn't fall like a sack, nor stay stiff).
++        if (!world->makeLiveRagdoll(mPtr, kick, 0.9f, 0.12f, 0.9f))
++            return false;
++        mLiveRagdoll = true;
++        mLiveRagdollTime = 0;
++        mLiveRagdollRest = 0;
++        mLiveRagdollLast = mPtr.getRefData().getPosition().asVec3();
++        CreatureStats& stats = mPtr.getClass().getCreatureStats(mPtr);
++        stats.setKnockedDown(true);
++        stats.setHitRecovery(false);
++        // As for a knockdown: no weapon swing on the way down.
++        if (!mCurrentWeapon.empty())
++            mAnimation->disable(mCurrentWeapon);
++        if (mUpperBodyState > UpperBodyState::WeaponEquipped)
++        {
++            mUpperBodyState = UpperBodyState::WeaponEquipped;
++            if (mWeaponType > ESM::Weapon::None)
++                mAnimation->showWeapons(true);
++        }
++        else if (mUpperBodyState < UpperBodyState::WeaponEquipped)
++            mUpperBodyState = UpperBodyState::None;
++        mHitState = CharState_None;
++        mCurrentHit.clear();
++        resetCurrentMovementState();
++        resetCurrentIdleState();
++        resetCurrentJumpState();
++        mAnimation->stopAllAnimations();
++        mFlinchAngle = mFlinchSpeed = osg::Vec2f();
++        mFlinching = false;
++        mAnimation->setFlinch(osg::Quat());
++        world->setActorCollisionMode(mPtr, true, false);
++        return true;
++    }
++
++    void CharacterController::updateLiveRagdoll(float duration)
++    {
++        MWBase::World* world = MWBase::Environment::get().getWorld();
++        const std::vector<std::pair<std::string, osg::Matrixf>> poses = world->getRagdollBonePoses(mPtr);
++        CreatureStats& stats = mPtr.getClass().getCreatureStats(mPtr);
++        if (poses.empty())
++        {
++            // Gone (it came apart): the knockdown animation takes over.
++            mLiveRagdoll = false;
++            return;
++        }
++        for (const auto& [bone, matrix] : poses)
++            if (!bone.empty())
++                mAnimation->setBoneWorldMatrix(bone, matrix);
++        stats.setKnockedDown(true);
++        world->setActorCollisionMode(mPtr, true, false);
++
++        mLiveRagdollTime += duration;
++        const osg::Vec3f main = poses.front().second.getTrans();
++        const float speed = duration > 0 ? (main - mLiveRagdollLast).length() / duration : 0.f;
++        mLiveRagdollLast = main;
++        if (speed < 25.f)
++            mLiveRagdollRest += duration;
++        else
++            mLiveRagdollRest = 0;
++
++        const bool knockout = stats.getFatigue().getCurrent() < 0 || stats.getFatigue().getBase() == 0;
++        const float getUpTime = deliriumConfig().mGetUpTime;
++        if (!knockout
++            && ((mLiveRagdollRest > 0.4f && mLiveRagdollTime > getUpTime) || mLiveRagdollTime > getUpTime + 4.f))
++            getUpFromRagdoll(poses);
++    }
++
++    void CharacterController::getUpFromRagdoll(const std::vector<std::pair<std::string, osg::Matrixf>>& poses)
++    {
++        MWBase::World* world = MWBase::Environment::get().getWorld();
++        world->removeRagdoll(mPtr);
++        mLiveRagdoll = false;
++        world->setActorCollisionMode(mPtr, true, true);
++
++        // Where it lies, on the ground, facing away from its head: Morrowind's knockdown gets up from lying on
++        // its back.
++        const osg::Vec3f pelvis = poses.front().second.getTrans();
++        osg::Vec3f toHead;
++        for (const auto& [bone, matrix] : poses)
++            if (Misc::StringUtils::ciEqual(bone, "Bip01 Head"))
++                toHead = matrix.getTrans() - pelvis;
++        toHead.z() = 0;
++        const osg::Vec3f position = mPtr.getRefData().getPosition().asVec3();
++        world->moveObject(mPtr, osg::Vec3f(pelvis.x(), pelvis.y(), std::max(position.z(), pelvis.z() - 30.f)));
++        if (toHead.normalize() > 0)
++        {
++            const osg::Vec3f forward = -toHead;
++            const ESM::Position& pos = mPtr.getRefData().getPosition();
++            world->rotateObject(mPtr, osg::Vec3f(pos.rot[0], pos.rot[1], std::atan2(forward.x(), forward.y())));
++        }
++        mPtr.getClass().adjustPosition(mPtr, false);
++
++        mAnimation->blendFromPose(poses, 0.5f);
++        CreatureStats& stats = mPtr.getClass().getCreatureStats(mPtr);
++        stats.setKnockedDown(true);
++        mHitState = CharState_KnockDown;
++        mCurrentHit = "knockdown";
++        playBlendedAnimation(mCurrentHit, Priority_Knockdown, MWRender::BlendMask_All, true, 1, "start", "stop",
++            0.55f, std::numeric_limits<uint32_t>::max());
++    }
++
++    void CharacterController::updateFlinch(float duration)
++    {
++        if (!mFlinching)
++            return;
++        // A spring, a little under-damped: it gives, comes back past straight a bit, and settles.
++        constexpr float stiffness = 110.f;
++        constexpr float damping = 8.f;
++        constexpr float maxAngle = 0.55f;
++        float left = std::min(duration, 0.1f);
++        while (left > 0)
++        {
++            const float dt = std::min(left, 1.f / 60.f);
++            left -= dt;
++            mFlinchSpeed += (mFlinchAngle * -stiffness - mFlinchSpeed * damping) * dt;
++            mFlinchAngle += mFlinchSpeed * dt;
++            if (mFlinchAngle.length() > maxAngle)
++                mFlinchAngle *= maxAngle / mFlinchAngle.length();
++        }
++        const float angle = mFlinchAngle.length();
++        if (angle < 0.002f && mFlinchSpeed.length() < 0.02f)
++        {
++            mFlinchAngle = mFlinchSpeed = osg::Vec2f();
++            mFlinching = false;
++            mAnimation->setFlinch(osg::Quat());
++            return;
++        }
++        // The top of the body goes the way the blow pushes it: turning about up x that way.
++        const osg::Vec3f axis(-mFlinchAngle.y() / angle, mFlinchAngle.x() / angle, 0.f);
++        mAnimation->setFlinch(osg::Quat(angle, axis));
 +    }
 +
 +    void CharacterController::driveRagdoll()
@@ -822,29 +1138,51 @@ index 664f293fb..982fbc38f 100644
      {
          // Keeping track of when to stop a continuous VFX seems to be very difficult to do inside the spells code,
 diff --git a/apps/openmw/mwmechanics/character.hpp b/apps/openmw/mwmechanics/character.hpp
-index a07fe7204..8ae6aa499 100644
+index a07fe7204..2ca7f8494 100644
 --- a/apps/openmw/mwmechanics/character.hpp
 +++ b/apps/openmw/mwmechanics/character.hpp
-@@ -163,6 +163,9 @@ namespace MWMechanics
+@@ -163,6 +163,17 @@ namespace MWMechanics
          std::string mCurrentHit;
  
          UpperBodyState mUpperBodyState{ UpperBodyState::None };
 +        bool mRagdoll = false; // the body is a ragdoll, which drives the bones
 +        bool mRagdollRestored = false; // tried to bring back how it lay (see restoreRagdoll)
++        // Fisica (Delirium, see delirium.hpp): thrown down alive, and the bend from light hits.
++        bool mLiveRagdoll = false;
++        float mLiveRagdollTime = 0;
++        float mLiveRagdollRest = 0;
++        osg::Vec3f mLiveRagdollLast;
++        osg::Vec2f mFlinchAngle; // the spine's bend, in the actor's space: direction times angle (radians)
++        osg::Vec2f mFlinchSpeed;
++        bool mFlinching = false;
 +        bool mDying = false; // in kill()
          bool mResetIdleOnAttackEnd{ false };
  
          JumpingState mJumpState{ JumpState_None };
-@@ -231,6 +234,9 @@ namespace MWMechanics
+@@ -231,6 +242,15 @@ namespace MWMechanics
          void updateMagicEffects() const;
  
          void playDeath(float startpoint, CharacterState death);
 +        bool startRagdoll();
++        bool deliriumEligible() const;
++        bool canFallDown() const;
++        bool startLiveRagdoll(const osg::Vec3f& kick);
++        void updateLiveRagdoll(float duration);
++        void getUpFromRagdoll(const std::vector<std::pair<std::string, osg::Matrixf>>& poses);
++        void updateFlinch(float duration);
 +        void driveRagdoll();
 +        void restoreRagdoll();
          CharacterState chooseRandomDeathState() const;
          void playRandomDeath(float startpoint = 0.0f);
  
+@@ -311,6 +331,7 @@ namespace MWMechanics
+         bool isCastingSpell() const;
+         bool isReadyToBlock() const;
+         bool isKnockedDown() const;
++        bool isLiveRagdoll() const { return mLiveRagdoll; }
+         bool isKnockedOut() const;
+         bool isRecovery() const;
+         bool isSneaking() const;
 diff --git a/apps/openmw/mwmechanics/combat.cpp b/apps/openmw/mwmechanics/combat.cpp
 index dbb31f2a3..7ff5d060f 100644
 --- a/apps/openmw/mwmechanics/combat.cpp
@@ -987,7 +1325,7 @@ index 3531b7fde..0b7b344e8 100644
  
          mSpells.readState(state.mSpells, this);
 diff --git a/apps/openmw/mwmechanics/creaturestats.hpp b/apps/openmw/mwmechanics/creaturestats.hpp
-index 4cf4c2e42..1a634a871 100644
+index 4cf4c2e42..39ecf2baf 100644
 --- a/apps/openmw/mwmechanics/creaturestats.hpp
 +++ b/apps/openmw/mwmechanics/creaturestats.hpp
 @@ -5,6 +5,11 @@
@@ -1002,32 +1340,48 @@ index 4cf4c2e42..1a634a871 100644
  
  #include "activespells.hpp"
  #include "aisequence.hpp"
-@@ -13,6 +18,7 @@
+@@ -12,7 +17,9 @@
+ #include "drawstate.hpp"
  #include "magiceffects.hpp"
  #include "spells.hpp"
++#include "delirium.hpp"
  #include "stat.hpp"
 +#include "stuckprojectiles.hpp"
  
  #include <components/esm/attr.hpp>
  #include <components/esm/refid.hpp>
-@@ -59,6 +65,10 @@ namespace MWMechanics
+@@ -59,6 +66,12 @@ namespace MWMechanics
          bool mKnockdownOverOneFrame = false;
          bool mHitRecovery = false;
          bool mBlock = false;
 +        osg::Vec3f mDeathKick; // how the killing blow throws the body
++        DeliriumHit mDeliriumHit; // the last hit, for Delirium (see delirium.hpp)
++        bool mDeliriumBlocked = false; // set from Lua: no Delirium for this actor (a mod holds it)
 +        std::vector<std::pair<std::string, osg::Matrixf>> mRagdollPose;
 +        std::vector<StuckProjectile> mStuckProjectiles;
 +        std::map<ESM::RefId, int> mEmbeddedAmmo;
          unsigned int mMovementFlags = 0;
  
          float mFallHeight = 0.f;
-@@ -231,6 +241,23 @@ namespace MWMechanics
+@@ -231,6 +244,35 @@ namespace MWMechanics
          void setBlock(bool value);
          bool getBlock() const;
  
 +        /// How the killing blow throws the body (velocity change; not saved).
 +        void setDeathKick(const osg::Vec3f& kick) { mDeathKick = kick; }
 +        const osg::Vec3f& getDeathKick() const { return mDeathKick; }
++
++        void setDeliriumHit(const DeliriumHit& hit) { mDeliriumHit = hit; }
++        bool takeDeliriumHit(DeliriumHit& hit)
++        {
++            if (!mDeliriumHit.mPending)
++                return false;
++            hit = mDeliriumHit;
++            mDeliriumHit.mPending = false;
++            return true;
++        }
++        void setDeliriumBlocked(bool blocked) { mDeliriumBlocked = blocked; }
++        bool isDeliriumBlocked() const { return mDeliriumBlocked; }
 +
 +        /// Where a dead body's ragdoll bones lie (world matrices; so it lies the same after loading, or coming back
 +        /// to it). Parents first.
@@ -1045,6 +1399,51 @@ index 4cf4c2e42..1a634a871 100644
          std::multimap<ESM::RefId, ESM::RefNum>& getSummonedCreatureMap(); // <Effect, summoned creature>
  
          enum Flag
+diff --git a/apps/openmw/mwmechanics/delirium.hpp b/apps/openmw/mwmechanics/delirium.hpp
+new file mode 100644
+index 000000000..0440cac28
+--- /dev/null
++++ b/apps/openmw/mwmechanics/delirium.hpp
+@@ -0,0 +1,39 @@
++#ifndef OPENMW_MWMECHANICS_DELIRIUM_H
++#define OPENMW_MWMECHANICS_DELIRIUM_H
++
++#include <osg/Vec3f>
++
++namespace MWMechanics
++{
++    // Fisica (0.51 Android): "Delirium", physical hit reactions for NPCs and creatures (after Skyrim Delirium).
++    // Light hits bend the body away from the blow (a spring on the spine and neck); hard ones (and knockdowns)
++    // throw it into a ragdoll with muscles that fade, which gets up again with the knockdown animation.
++    // Set from Lua (world.setDelirium); off by default, so the engine behaves as before.
++    struct DeliriumConfig
++    {
++        bool mEnabled = false;
++        float mIntensity = 1.f; // how far light hits bend the body
++        float mFallThreshold = 0.25f; // a hit taking this part of the max health throws it down
++        bool mCreatures = true; // creatures too (not only NPCs)
++        bool mReplaceHits = true; // light hits: no hit animation, only the bend
++        bool mKnockdowns = true; // the engine's knockdowns (and knockouts) are falls too
++        float mGetUpTime = 1.5f; // seconds lying down before getting up
++    };
++
++    inline DeliriumConfig& deliriumConfig()
++    {
++        static DeliriumConfig config;
++        return config;
++    }
++
++    // The last hit, until the character controller takes it.
++    struct DeliriumHit
++    {
++        osg::Vec3f mAway; // horizontal, away from the attacker (unit), or zero
++        osg::Vec3f mPoint; // where it hit, or zero
++        float mStrength = 0; // health taken / max health
++        bool mPending = false;
++    };
++}
++
++#endif
 diff --git a/apps/openmw/mwmechanics/spellcasting.cpp b/apps/openmw/mwmechanics/spellcasting.cpp
 index c7571c35a..3d41feddd 100644
 --- a/apps/openmw/mwmechanics/spellcasting.cpp
@@ -3026,7 +3425,7 @@ index bacf68f7f..2065afe66 100644
  }
  
 diff --git a/apps/openmw/mwphysics/physicssystem.cpp b/apps/openmw/mwphysics/physicssystem.cpp
-index 3c2238bac..c1c884451 100644
+index 3c2238bac..0f85473f8 100644
 --- a/apps/openmw/mwphysics/physicssystem.cpp
 +++ b/apps/openmw/mwphysics/physicssystem.cpp
 @@ -10,11 +10,21 @@
@@ -3264,7 +3663,7 @@ index 3c2238bac..c1c884451 100644
          mObjects.clear();
          mActors.clear();
          mProjectiles.clear();
-@@ -437,6 +608,554 @@ namespace MWPhysics
+@@ -437,6 +608,563 @@ namespace MWPhysics
  
          if (obj->isAnimated())
              mAnimatedObjects.emplace(obj.get(), false);
@@ -3473,6 +3872,15 @@ index 3c2238bac..c1c884451 100644
 +    {
 +        mBodyHeights.erase(actor.mRef);
 +        mRagdolls.erase(actor.mRef);
++    }
++
++    bool PhysicsSystem::setRagdollMuscles(const MWWorld::ConstPtr& actor, float tone, float toneEnd, float seconds)
++    {
++        const auto found = mRagdolls.find(actor.mRef);
++        if (found == mRagdolls.end() || !found->second->isJointed())
++            return false;
++        found->second->setMuscles(tone, toneEnd, seconds);
++        return true;
 +    }
 +
 +    bool PhysicsSystem::hasRagdoll(const MWWorld::ConstPtr& actor) const
@@ -3819,7 +4227,7 @@ index 3c2238bac..c1c884451 100644
      }
  
      void PhysicsSystem::remove(const MWWorld::Ptr& ptr)
-@@ -444,12 +1163,15 @@ namespace MWPhysics
+@@ -444,12 +1172,15 @@ namespace MWPhysics
          if (auto foundObject = mObjects.find(ptr.mRef); foundObject != mObjects.end())
          {
              mAnimatedObjects.erase(foundObject->second.get());
@@ -3835,7 +4243,7 @@ index 3c2238bac..c1c884451 100644
          }
      }
  
-@@ -466,6 +1188,8 @@ namespace MWPhysics
+@@ -466,6 +1197,8 @@ namespace MWPhysics
              foundObject->second->updatePtr(updated);
          else if (auto foundActor = mActors.find(old.mRef); foundActor != mActors.end())
              foundActor->second->updatePtr(updated);
@@ -3844,7 +4252,7 @@ index 3c2238bac..c1c884451 100644
  
          for (auto& [_, actor] : mActors)
          {
-@@ -531,6 +1255,9 @@ namespace MWPhysics
+@@ -531,6 +1264,9 @@ namespace MWPhysics
      {
          if (auto foundObject = mObjects.find(ptr.mRef); foundObject != mObjects.end())
          {
@@ -3854,7 +4262,7 @@ index 3c2238bac..c1c884451 100644
              foundObject->second->setRotation(rotate);
              mTaskScheduler->updateSingleAabb(foundObject->second);
          }
-@@ -548,7 +1275,11 @@ namespace MWPhysics
+@@ -548,7 +1284,11 @@ namespace MWPhysics
      {
          if (auto foundObject = mObjects.find(ptr.mRef); foundObject != mObjects.end())
          {
@@ -3866,7 +4274,7 @@ index 3c2238bac..c1c884451 100644
              mTaskScheduler->updateSingleAabb(foundObject->second);
          }
          else if (auto foundActor = mActors.find(ptr.mRef); foundActor != mActors.end())
-@@ -730,7 +1461,7 @@ namespace MWPhysics
+@@ -730,7 +1470,7 @@ namespace MWPhysics
          }
      }
  
@@ -3875,7 +4283,7 @@ index 3c2238bac..c1c884451 100644
      {
          auto* player = getActor(MWMechanics::getPlayer());
          const auto world = MWBase::Environment::get().getWorld();
-@@ -740,18 +1471,181 @@ namespace MWPhysics
+@@ -740,18 +1480,181 @@ namespace MWPhysics
          mActorsPositions.clear();
          if (!mActors.empty())
              mActorsPositions.reserve(mActors.size() - 1);
@@ -4057,7 +4465,7 @@ index 3c2238bac..c1c884451 100644
      }
  
      void PhysicsSystem::updateAnimatedCollisionShape(const MWWorld::Ptr& object)
-@@ -829,6 +1723,8 @@ namespace MWPhysics
+@@ -829,6 +1732,8 @@ namespace MWPhysics
  
      void PhysicsSystem::updateWater()
      {
@@ -4066,7 +4474,7 @@ index 3c2238bac..c1c884451 100644
          if (mWaterCollisionObject)
          {
              mTaskScheduler->removeCollisionObject(mWaterCollisionObject.get());
-@@ -843,6 +1739,9 @@ namespace MWPhysics
+@@ -843,6 +1748,9 @@ namespace MWPhysics
          mWaterCollisionObject = std::make_unique<btCollisionObject>();
          mWaterCollisionShape = std::make_unique<btStaticPlaneShape>(btVector3(0, 0, 1), mWaterHeight);
          mWaterCollisionObject->setCollisionShape(mWaterCollisionShape.get());
@@ -4077,7 +4485,7 @@ index 3c2238bac..c1c884451 100644
              mWaterCollisionObject.get(), CollisionType_Water, CollisionType_Actor | CollisionType_Projectile);
      }
 diff --git a/apps/openmw/mwphysics/physicssystem.hpp b/apps/openmw/mwphysics/physicssystem.hpp
-index 0ab0cf91a..386cd264d 100644
+index 0ab0cf91a..455f69fb1 100644
 --- a/apps/openmw/mwphysics/physicssystem.hpp
 +++ b/apps/openmw/mwphysics/physicssystem.hpp
 @@ -7,20 +7,27 @@
@@ -4159,7 +4567,7 @@ index 0ab0cf91a..386cd264d 100644
      struct ContactPoint
      {
          MWWorld::Ptr mObject;
-@@ -163,6 +198,84 @@ namespace MWPhysics
+@@ -163,6 +198,86 @@ namespace MWPhysics
  
          void addObject(const MWWorld::Ptr& ptr, VFS::Path::NormalizedView mesh, osg::Quat rotation,
              int collisionType = CollisionType_World);
@@ -4192,6 +4600,8 @@ index 0ab0cf91a..386cd264d 100644
 +        /// Make the ragdoll start out still and asleep (one that was lying there before).
 +        void settleRagdoll(const MWWorld::ConstPtr& actor);
 +        void removeRagdoll(const MWWorld::ConstPtr& actor);
++        // Fisica (Delirium): see Ragdoll::setMuscles. @return false if it has no jointed ragdoll.
++        bool setRagdollMuscles(const MWWorld::ConstPtr& actor, float tone, float toneEnd, float seconds);
 +        bool hasRagdoll(const MWWorld::ConstPtr& actor) const;
 +        /// Push the dead actor's ragdoll where it was hit (point, world space) with impulse. False without one.
 +        bool strikeRagdoll(const MWWorld::ConstPtr& actor, const osg::Vec3f& point, const osg::Vec3f& impulse);
@@ -4244,7 +4654,7 @@ index 0ab0cf91a..386cd264d 100644
          void addActor(const MWWorld::Ptr& ptr, VFS::Path::NormalizedView mesh);
  
          int addProjectile(
-@@ -199,8 +312,9 @@ namespace MWPhysics
+@@ -199,8 +314,9 @@ namespace MWPhysics
          void stepSimulation(
              float dt, bool skipSimulation, osg::Timer_t frameStart, unsigned int frameNumber, osg::Stats& stats);
  
@@ -4256,7 +4666,7 @@ index 0ab0cf91a..386cd264d 100644
          void debugDraw();
  
          std::vector<MWWorld::Ptr> getCollisions(const MWWorld::ConstPtr& ptr, int collisionGroup,
-@@ -294,10 +408,20 @@ namespace MWPhysics
+@@ -294,10 +410,20 @@ namespace MWPhysics
  
          void prepareSimulation(bool willSimulate, std::vector<Simulation>& simulations);
  
@@ -4278,7 +4688,7 @@ index 0ab0cf91a..386cd264d 100644
          std::unique_ptr<PhysicsTaskScheduler> mTaskScheduler;
  
          std::unique_ptr<Resource::BulletShapeManager> mShapeManager;
-@@ -306,6 +430,19 @@ namespace MWPhysics
+@@ -306,6 +432,19 @@ namespace MWPhysics
          using ObjectMap = std::unordered_map<const MWWorld::LiveCellRefBase*, std::shared_ptr<Object>>;
          ObjectMap mObjects;
  
@@ -4348,10 +4758,10 @@ index fc8fd94c3..327f0e893 100644
          osg::Vec3f velocity() { return std::exchange(mVelocity, osg::Vec3f()); }
 diff --git a/apps/openmw/mwphysics/ragdoll.cpp b/apps/openmw/mwphysics/ragdoll.cpp
 new file mode 100644
-index 000000000..103b932c5
+index 000000000..b3938b57a
 --- /dev/null
 +++ b/apps/openmw/mwphysics/ragdoll.cpp
-@@ -0,0 +1,690 @@
+@@ -0,0 +1,742 @@
 +#include "ragdoll.hpp"
 +
 +#include <algorithm>
@@ -4420,16 +4830,53 @@ index 000000000..103b932c5
 +    {
 +    public:
 +        std::vector<std::pair<btRigidBody*, btRigidBody*>> mPairs;
++        // Fisica (Delirium): muscles. Each joint turns back towards how it was made (its child relative to its
++        // parent), as hard as the tone (0: limp, as before), which fades from mTone to mToneEnd over mToneTime.
++        std::vector<btQuaternion> mTargets;
++        btScalar mTone = 0;
++        btScalar mToneEnd = 0;
++        btScalar mToneTime = 0;
++        btScalar mToneLeft = 0;
 +
 +        void updateAction(btCollisionWorld*, btScalar timeStep) override
 +        {
 +            constexpr btScalar rate = 14; // per second: about a fifth of the turning gone each step at 60 Hz
 +            const btScalar fraction = 1 - std::exp(-rate * timeStep);
-+            for (const auto& [a, b] : mPairs)
++            btScalar tone = mToneEnd;
++            if (mToneLeft > 0 && mToneTime > 0)
 +            {
++                tone = mToneEnd + (mTone - mToneEnd) * (mToneLeft / mToneTime);
++                mToneLeft -= timeStep;
++            }
++            const btScalar muscleFraction = 1 - std::exp(-24 * tone * timeStep);
++            for (size_t i = 0; i < mPairs.size(); ++i)
++            {
++                btRigidBody* a = mPairs[i].first;
++                btRigidBody* b = mPairs[i].second;
 +                if (!a->isActive() && !b->isActive())
 +                    continue;
-+                const btVector3 relative = b->getAngularVelocity() - a->getAngularVelocity();
++                btVector3 relative = b->getAngularVelocity() - a->getAngularVelocity();
++                if (tone > 0 && i < mTargets.size())
++                {
++                    // Turning that would bring the joint back to its pose in about a tenth of a second.
++                    const btQuaternion qa = a->getOrientation();
++                    btQuaternion error = mTargets[i] * (qa.inverse() * b->getOrientation()).inverse();
++                    if (error.getW() < 0)
++                        error = -error;
++                    const btScalar angle = error.getAngle();
++                    btVector3 desired(0, 0, 0);
++                    if (angle > btScalar(1e-3))
++                        desired = quatRotate(qa, error.getAxis()) * (angle * 10);
++                    const btScalar massA = a->getInvMass() > 0 ? 1 / a->getInvMass() : 0;
++                    const btScalar massB = b->getInvMass() > 0 ? 1 / b->getInvMass() : 0;
++                    if (massA + massB > 0)
++                    {
++                        const btVector3 change = (relative - desired) * muscleFraction;
++                        a->setAngularVelocity(a->getAngularVelocity() + change * (massB / (massA + massB)));
++                        b->setAngularVelocity(b->getAngularVelocity() - change * (massA / (massA + massB)));
++                        relative = b->getAngularVelocity() - a->getAngularVelocity() - desired;
++                    }
++                }
 +                if (relative.length2() < 1e-4f)
 +                    continue;
 +                // The lighter part gives more.
@@ -4848,9 +5295,24 @@ index 000000000..103b932c5
 +    {
 +        auto friction = std::make_unique<JointFriction>();
 +        for (const auto& joint : mJoints)
++        {
 +            friction->mPairs.emplace_back(&joint->getRigidBodyA(), &joint->getRigidBodyB());
++            friction->mTargets.push_back(
++                joint->getRigidBodyA().getOrientation().inverse() * joint->getRigidBodyB().getOrientation());
++        }
 +        mJointFriction = std::move(friction);
 +        mTaskScheduler->addAction(mJointFriction.get());
++    }
++
++    void Ragdoll::setMuscles(float tone, float toneEnd, float seconds)
++    {
++        auto* friction = static_cast<JointFriction*>(mJointFriction.get());
++        if (friction == nullptr)
++            return;
++        friction->mToneEnd = toneEnd;
++        friction->mTone = tone;
++        friction->mToneTime = seconds;
++        friction->mToneLeft = seconds;
 +    }
 +
 +    std::optional<osg::Vec3f> Ragdoll::getActorPosition(const osg::Vec3f& actorPosition)
@@ -5044,10 +5506,10 @@ index 000000000..103b932c5
 +}
 diff --git a/apps/openmw/mwphysics/ragdoll.hpp b/apps/openmw/mwphysics/ragdoll.hpp
 new file mode 100644
-index 000000000..25b411765
+index 000000000..0e49ce863
 --- /dev/null
 +++ b/apps/openmw/mwphysics/ragdoll.hpp
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,159 @@
 +#ifndef OPENMW_MWPHYSICS_RAGDOLL_H
 +#define OPENMW_MWPHYSICS_RAGDOLL_H
 +
@@ -5145,6 +5607,8 @@ index 000000000..25b411765
 +
 +        /// Still and asleep, as if it had been lying there (until something disturbs it).
 +        void setAtRest();
++        // Fisica (Delirium): how hard the joints keep their pose (0: limp), fading from tone to toneEnd.
++        void setMuscles(float tone, float toneEnd, float seconds);
 +
 +        /// Puts each part that is more than depth under the ground (groundAt: its height there) back on top of it,
 +        /// still: a small piece can slip through the ground on its own.
@@ -5206,7 +5670,7 @@ index 000000000..25b411765
 +
 +#endif
 diff --git a/apps/openmw/mwrender/animation.cpp b/apps/openmw/mwrender/animation.cpp
-index 492030577..4440a0a47 100644
+index 492030577..dc1ca760c 100644
 --- a/apps/openmw/mwrender/animation.cpp
 +++ b/apps/openmw/mwrender/animation.cpp
 @@ -3,13 +3,19 @@
@@ -5601,7 +6065,77 @@ index 492030577..4440a0a47 100644
      const Animation::NodeMap& Animation::getNodeMap() const
      {
          if (!mNodeMapCreated && mObjectRoot)
-@@ -1659,6 +2016,10 @@ namespace MWRender
+@@ -1337,8 +1694,69 @@ namespace MWRender
+         position += off - osg::componentMultiply(mAccumCtrl->getTranslation(oldtime), mAccumulate);
+     }
+ 
++    namespace
++    {
++        // Fisica (Delirium): how far the blend from a ragdoll's pose still has to go (1: all the pose, 0: done).
++        struct PoseBlendState : public osg::Referenced
++        {
++            float mWeight = 0;
++        };
++
++        // After the bone's keyframes: its world matrix between where the ragdoll left it and the animation's.
++        class PoseBlendController : public SceneUtil::NodeCallback<PoseBlendController, osg::MatrixTransform*>
++        {
++        public:
++            PoseBlendController(PoseBlendState* state, const osg::Matrixf& world)
++                : mState(state)
++                , mWorld(world)
++            {
++            }
++
++            void operator()(osg::MatrixTransform* node, osg::NodeVisitor* nv)
++            {
++                const float weight = mState->mWeight;
++                if (weight > 0)
++                {
++                    osg::NodePathList paths = node->getParentalNodePaths();
++                    if (!paths.empty())
++                    {
++                        osg::NodePath& toParent = paths.front();
++                        toParent.pop_back();
++                        const osg::Matrixf parentWorld = osg::computeLocalToWorld(toParent);
++                        const osg::Matrixf animated = osg::Matrixf(node->getMatrix()) * parentWorld;
++                        osg::Vec3f animTrans, ragTrans, animScale, ragScale;
++                        osg::Quat animRot, ragRot, so;
++                        animated.decompose(animTrans, animRot, animScale, so);
++                        mWorld.decompose(ragTrans, ragRot, ragScale, so);
++                        const float w = weight * weight * (3 - 2 * weight);
++                        osg::Quat rot;
++                        rot.slerp(w, animRot, ragRot);
++                        const osg::Vec3f trans = animTrans * (1 - w) + ragTrans * w;
++                        const osg::Matrixf world
++                            = osg::Matrixf::scale(animScale) * osg::Matrixf::rotate(rot) * osg::Matrixf::translate(trans);
++                        node->setMatrix(world * osg::Matrixf::inverse(parentWorld));
++                    }
++                }
++                traverse(node, nv);
++            }
++
++        private:
++            osg::ref_ptr<PoseBlendState> mState;
++            osg::Matrixf mWorld;
++        };
++    }
++
+     osg::Vec3f Animation::runAnimation(float duration)
+     {
++        if (mPoseBlend != nullptr)
++        {
++            // Fisica (Delirium): the blend from a ragdoll's pose goes; once done its controllers just pass on.
++            mPoseBlendLeft -= duration;
++            auto* state = static_cast<PoseBlendState*>(mPoseBlend.get());
++            state->mWeight = mPoseBlendTime > 0 ? std::max(0.f, mPoseBlendLeft / mPoseBlendTime) : 0.f;
++            if (state->mWeight <= 0)
++                mPoseBlend = nullptr;
++        }
+         osg::Vec3f movement(0.f, 0.f, 0.f);
+         AnimStateMap::iterator stateiter = mStates.begin();
+         while (stateiter != mStates.end())
+@@ -1659,6 +2077,10 @@ namespace MWRender
          mObjectRoot->addCullCallback(mLightListCallback);
          if (mTransparencyUpdater)
              mObjectRoot->addCullCallback(mTransparencyUpdater);
@@ -5612,8 +6146,58 @@ index 492030577..4440a0a47 100644
      }
  
      osg::Group* Animation::getObjectRoot()
+@@ -1931,6 +2353,49 @@ namespace MWRender
+         mHeadController = addRotateController("bip01 head");
+         mSpineController = addRotateController("bip01 spine1");
+         mRootController = addRotateController("bip01");
++        mFlinchLower = addRotateController("bip01 spine");
++        mFlinchUpper = addRotateController("bip01 spine2");
++        mFlinchNeck = addRotateController("bip01 neck");
++        mPoseBlend = nullptr;
++        mPoseBlendLeft = 0;
++    }
++
++    void Animation::setFlinch(const osg::Quat& rotation)
++    {
++        const osg::Quat none;
++        const std::pair<RotateController*, float> parts[]
++            = { { mFlinchLower.get(), 0.35f }, { mFlinchUpper.get(), 0.4f }, { mFlinchNeck.get(), 0.45f } };
++        for (const auto& [controller, share] : parts)
++        {
++            if (controller == nullptr)
++                continue;
++            osg::Quat part;
++            part.slerp(share, none, rotation);
++            controller->setRotate(part);
++        }
++    }
++
++    void Animation::blendFromPose(
++        const std::vector<std::pair<std::string, osg::Matrixf>>& worldPoses, float seconds)
++    {
++        if (seconds <= 0)
++            return;
++        osg::ref_ptr<PoseBlendState> state = new PoseBlendState;
++        state->mWeight = 1;
++        for (const auto& [bone, world] : worldPoses)
++        {
++            if (bone.empty())
++                continue;
++            const auto found = getNodeMap().find(bone);
++            if (found == getNodeMap().end())
++                continue;
++            osg::ref_ptr<osg::Callback> controller = new PoseBlendController(state.get(), world);
++            found->second->addUpdateCallback(controller);
++            mActiveControllers.emplace_back(found->second, controller);
++        }
++        mPoseBlend = state;
++        mPoseBlendTime = seconds;
++        mPoseBlendLeft = seconds;
+     }
+ 
+     osg::ref_ptr<RotateController> Animation::addRotateController(std::string_view bone)
 diff --git a/apps/openmw/mwrender/animation.hpp b/apps/openmw/mwrender/animation.hpp
-index 7111d3df1..8f528009a 100644
+index 7111d3df1..b386b1349 100644
 --- a/apps/openmw/mwrender/animation.hpp
 +++ b/apps/openmw/mwrender/animation.hpp
 @@ -17,6 +17,10 @@
@@ -5637,13 +6221,33 @@ index 7111d3df1..8f528009a 100644
          MWWorld::Ptr mPtr;
  
          Resource::ResourceSystem* mResourceSystem;
-@@ -449,6 +456,56 @@ namespace MWRender
+@@ -224,6 +231,13 @@ namespace MWRender
+         osg::ref_ptr<RotateController> mHeadController;
+         osg::ref_ptr<RotateController> mSpineController;
+         osg::ref_ptr<RotateController> mRootController;
++        // Fisica (Delirium): the spine and neck bend away from a blow (see setFlinch).
++        osg::ref_ptr<RotateController> mFlinchLower;
++        osg::ref_ptr<RotateController> mFlinchUpper;
++        osg::ref_ptr<RotateController> mFlinchNeck;
++        osg::ref_ptr<osg::Referenced> mPoseBlend; // see blendFromPose
++        float mPoseBlendLeft = 0;
++        float mPoseBlendTime = 0;
+         float mHeadYawRadians;
+         float mHeadPitchRadians;
+         float mUpperBodyYawRadians;
+@@ -449,6 +463,62 @@ namespace MWRender
          /// @note The matching is case-insensitive.
          const osg::Node* getNode(std::string_view name) const;
  
 +        /// For ragdolls: where a bone is (world matrix), and putting it somewhere. Only bones no animation drives
 +        /// stay where they're put (see stopAllAnimations).
 +        std::optional<osg::Matrixf> getBoneWorldMatrix(std::string_view bone) const;
++        /// Fisica (Delirium): bend the spine and neck by this rotation (in the actor's space; identity: none),
++        /// spread over the lower spine, the upper spine and the neck.
++        void setFlinch(const osg::Quat& rotation);
++        /// Fisica (Delirium): from these bone world matrices (where a ragdoll left them) to the animation, over
++        /// seconds (getting up).
++        void blendFromPose(const std::vector<std::pair<std::string, osg::Matrixf>>& worldPoses, float seconds);
 +        void setBoneWorldMatrix(std::string_view bone, const osg::Matrixf& world);
 +        /// Stop every animation, leaving the bones as they are.
 +        void stopAllAnimations();
@@ -7203,7 +7807,7 @@ index 316c1b9ef..061989d33 100644
          const auto cellX = cell->getCell()->getGridX();
          const auto cellY = cell->getCell()->getGridY();
 diff --git a/apps/openmw/mwworld/worldimp.cpp b/apps/openmw/mwworld/worldimp.cpp
-index c6cb28ae8..392fcc1b3 100644
+index c6cb28ae8..be104e056 100644
 --- a/apps/openmw/mwworld/worldimp.cpp
 +++ b/apps/openmw/mwworld/worldimp.cpp
 @@ -68,6 +68,7 @@
@@ -7250,7 +7854,7 @@ index c6cb28ae8..392fcc1b3 100644
          std::vector<std::pair<GlobalVariableName, ESM::Variant>> generateDefaultGlobals()
          {
              return {
-@@ -1367,14 +1383,357 @@ namespace MWWorld
+@@ -1367,14 +1383,370 @@ namespace MWWorld
          mPhysics->updateAnimatedCollisionShape(ptr);
      }
  
@@ -7360,6 +7964,19 @@ index c6cb28ae8..392fcc1b3 100644
 +    void World::removeRagdoll(const MWWorld::ConstPtr& actor)
 +    {
 +        mPhysics->removeRagdoll(actor);
++    }
++
++    bool World::makeLiveRagdoll(
++        const MWWorld::Ptr& actor, const osg::Vec3f& kick, float tone, float toneEnd, float seconds)
++    {
++        if (!makeRagdollBody(actor, kick, false))
++            return false;
++        if (mPhysics->getRagdollBonePoses(actor).size() < 2 || !mPhysics->setRagdollMuscles(actor, tone, toneEnd, seconds))
++        {
++            mPhysics->removeRagdoll(actor);
++            return false;
++        }
++        return true;
 +    }
 +
 +    void World::objectEnteredWater(const MWWorld::Ptr& object, const osg::Vec3f& position, float speed)
@@ -7609,7 +8226,7 @@ index c6cb28ae8..392fcc1b3 100644
      }
  
      void World::updateNavigator()
-@@ -1399,6 +1758,8 @@ namespace MWWorld
+@@ -1399,6 +1771,8 @@ namespace MWWorld
      {
          if (object.getShapeInstance()->mVisualCollisionType != Resource::VisualCollisionType::None)
              return;
@@ -7618,7 +8235,7 @@ index c6cb28ae8..392fcc1b3 100644
          const MWWorld::Ptr ptr = object.getPtr();
          const DetourNavigator::ObjectShapes shapes(object.getShapeInstance(),
              DetourNavigator::ObjectTransform{ ptr.getRefData().getPosition(), ptr.getCellRef().getScale() });
-@@ -1674,8 +2035,8 @@ namespace MWWorld
+@@ -1674,8 +2048,8 @@ namespace MWWorld
      {
          try
          {
@@ -7629,7 +8246,7 @@ index c6cb28ae8..392fcc1b3 100644
  
              // retrieve the object's top point's screen position so we know where to place the floating label
              if (!object.isEmpty())
-@@ -2016,6 +2377,10 @@ namespace MWWorld
+@@ -2016,6 +2390,10 @@ namespace MWWorld
                  moveObject(object, pos.asVec3());
              }
          }
@@ -7640,7 +8257,7 @@ index c6cb28ae8..392fcc1b3 100644
      }
  
      MWWorld::Ptr World::dropObjectOnGround(const Ptr& actor, const Ptr& object, int amount, bool copy)
-@@ -2986,7 +3351,11 @@ namespace MWWorld
+@@ -2986,7 +3364,11 @@ namespace MWWorld
  
          if (result.mHit)
          {
@@ -7654,7 +8271,7 @@ index c6cb28ae8..392fcc1b3 100644
          }
  
 diff --git a/apps/openmw/mwworld/worldimp.hpp b/apps/openmw/mwworld/worldimp.hpp
-index 3a6688d9a..9caac9b07 100644
+index 3a6688d9a..6e17bcd74 100644
 --- a/apps/openmw/mwworld/worldimp.hpp
 +++ b/apps/openmw/mwworld/worldimp.hpp
 @@ -1,6 +1,10 @@
@@ -7677,7 +8294,7 @@ index 3a6688d9a..9caac9b07 100644
          std::vector<std::string> mContentFiles;
  
          std::filesystem::path mUserDataPath;
-@@ -375,6 +381,31 @@ namespace MWWorld
+@@ -375,6 +381,33 @@ namespace MWWorld
          void rotateObject(const Ptr& ptr, const osg::Vec3f& rot,
              MWBase::RotationFlags flags = MWBase::RotationFlag_inverseOrder) override;
  
@@ -7698,6 +8315,8 @@ index 3a6688d9a..9caac9b07 100644
 +        bool makeRagdoll(
 +            const MWWorld::Ptr& actor, const osg::Vec3f& kick, bool allowOnePiece, bool atRest) override;
 +        void removeRagdoll(const MWWorld::ConstPtr& actor) override;
++        bool makeLiveRagdoll(
++            const MWWorld::Ptr& actor, const osg::Vec3f& kick, float tone, float toneEnd, float seconds) override;
 +        void knockObjectsWithMeleeAttack(const MWWorld::Ptr& attacker, const MWWorld::Ptr& weapon, int attackType,
 +            float attackStrength) override;
 +        /// A melee swing that hit no one and nothing loose: the sound of it meeting the world, if it does (from
