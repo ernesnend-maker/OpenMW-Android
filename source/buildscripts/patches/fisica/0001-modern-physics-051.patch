@@ -178,7 +178,7 @@ index 819c4ac91..d67a8407c 100644
              const MWWorld::Ptr& ptr, const osg::Vec3f& rot, RotationFlags flags = RotationFlag_inverseOrder)
              = 0;
 diff --git a/apps/openmw/mwclass/creature.cpp b/apps/openmw/mwclass/creature.cpp
-index 7effead29..7b4b88288 100644
+index 7effead29..0406ded8c 100644
 --- a/apps/openmw/mwclass/creature.cpp
 +++ b/apps/openmw/mwclass/creature.cpp
 @@ -258,6 +258,7 @@ namespace MWClass
@@ -212,7 +212,7 @@ index 7effead29..7b4b88288 100644
          if (!successful)
          {
              // Missed
-@@ -454,6 +460,52 @@ namespace MWClass
+@@ -454,6 +460,53 @@ namespace MWClass
                      stats.setHitRecovery(true); // Is this supposed to always occur?
              }
          }
@@ -234,6 +234,7 @@ index 7effead29..7b4b88288 100644
 +            if (!attacker.isEmpty() && sourceType == MWMechanics::DamageSourceType::Melee)
 +            {
 +                MWMechanics::CreatureStats& attackerStats = attacker.getClass().getCreatureStats(attacker);
++                MWMechanics::getDeliriumAttacker(attacker, hit.mAttackerStrength, hit.mAttackerMonster);
 +                const osg::Vec3f half = MWBase::Environment::get().getWorld()->getHalfExtents(ptr);
 +                MWMechanics::deliriumAim(hit, attackerStats.getSwingType(), ptr.getRefData().getPosition().asVec3(),
 +                    half.z() * 2.f, attacker.getRefData().getPosition().asVec3(), false);
@@ -282,7 +283,7 @@ index 11867daa4..91a77f9cb 100644
  
      bool Light::useAnim() const
 diff --git a/apps/openmw/mwclass/npc.cpp b/apps/openmw/mwclass/npc.cpp
-index f842c5215..3dfdf560a 100644
+index f842c5215..fb826c668 100644
 --- a/apps/openmw/mwclass/npc.cpp
 +++ b/apps/openmw/mwclass/npc.cpp
 @@ -605,6 +605,7 @@ namespace MWClass
@@ -306,7 +307,7 @@ index f842c5215..3dfdf560a 100644
  
          const MWWorld::Class& othercls = victim.getClass();
          MWMechanics::CreatureStats& otherstats = othercls.getCreatureStats(victim);
-@@ -828,8 +832,56 @@ namespace MWClass
+@@ -828,8 +832,57 @@ namespace MWClass
                  MWBase::Environment::get().getWindowManager()->activateHitOverlay();
          }
  
@@ -327,6 +328,7 @@ index f842c5215..3dfdf560a 100644
 +            if (!attacker.isEmpty() && sourceType == MWMechanics::DamageSourceType::Melee)
 +            {
 +                MWMechanics::CreatureStats& attackerStats = attacker.getClass().getCreatureStats(attacker);
++                MWMechanics::getDeliriumAttacker(attacker, hit.mAttackerStrength, hit.mAttackerMonster);
 +                const osg::Vec3f half = MWBase::Environment::get().getWorld()->getHalfExtents(ptr);
 +                MWMechanics::deliriumAim(hit, attackerStats.getSwingType(), ptr.getRefData().getPosition().asVec3(),
 +                    half.z() * 2.f, attacker.getRefData().getPosition().asVec3(), false);
@@ -593,7 +595,7 @@ index 270f6e1e4..b64853c1e 100644
              sol::optional<sol::table> damageLua = options.get<sol::optional<sol::table>>("damage");
              std::map<std::string, float> damageCpp;
 diff --git a/apps/openmw/mwlua/worldbindings.cpp b/apps/openmw/mwlua/worldbindings.cpp
-index 531460423..0ed8a254a 100644
+index 531460423..71863ca12 100644
 --- a/apps/openmw/mwlua/worldbindings.cpp
 +++ b/apps/openmw/mwlua/worldbindings.cpp
 @@ -24,11 +24,18 @@
@@ -615,7 +617,7 @@ index 531460423..0ed8a254a 100644
  #include "../mwworld/store.hpp"
  #include "../mwworld/worldmodel.hpp"
  
-@@ -253,6 +260,166 @@ namespace MWLua
+@@ -253,6 +260,169 @@ namespace MWLua
                  return MWBase::Environment::get().getESMStore()->insert(light);
              });
  
@@ -671,6 +673,9 @@ index 531460423..0ed8a254a 100644
 +            cfg.mDebug = options.get_or("debug", cfg.mDebug);
 +            cfg.mReal = options.get_or("real", cfg.mReal);
 +            cfg.mGuard = options.get_or("guard", cfg.mGuard);
++            cfg.mByStrength = options.get_or("byStrength", cfg.mByStrength);
++            cfg.mMonsters = options.get_or("monsters", cfg.mMonsters);
++            cfg.mMonsterPower = std::clamp(options.get_or("monsterPower", cfg.mMonsterPower), 1.f, 10.f);
 +            cfg.mAimed = options.get_or("aimed", cfg.mAimed);
 +            cfg.mHitStop = std::clamp(options.get_or("hitStop", cfg.mHitStop), 0.f, 0.3f);
 +            cfg.mPush = std::clamp(options.get_or("push", cfg.mPush), 0.f, 4.f);
@@ -833,7 +838,7 @@ index 61a148b7e..e778a172d 100644
          ++mDeathCount[actor.getCellRef().getRefId()];
  
 diff --git a/apps/openmw/mwmechanics/character.cpp b/apps/openmw/mwmechanics/character.cpp
-index 664f293fb..909f5e33d 100644
+index 664f293fb..75c432239 100644
 --- a/apps/openmw/mwmechanics/character.cpp
 +++ b/apps/openmw/mwmechanics/character.cpp
 @@ -50,7 +50,9 @@
@@ -970,7 +975,7 @@ index 664f293fb..909f5e33d 100644
          if (mDeathState == CharState_None)
              return;
  
-@@ -2805,6 +2879,651 @@ namespace MWMechanics
+@@ -2805,6 +2879,671 @@ namespace MWMechanics
          mWeaponType = ESM::Weapon::None;
      }
  
@@ -1145,10 +1150,30 @@ index 664f293fb..909f5e33d 100644
 +                blow.mPoint = hit.mPoint;
 +            if (hit.mAway.length2() > 0.01f)
 +                blow.mFrom = position - hit.mAway * 80.f + osg::Vec3f(0, 0, 110.f);
-+            // A plain blow (15 points) pushes 45 N s; twice the damage, 2^0.8 times as hard.
 +            const float damage = hit.mStrength * maxHealth;
-+            blow.mPush = hasHit ? 45.f * std::clamp(std::pow(std::max(damage, 0.f) / 15.f, 0.8f), 0.4f, 3.f) : 110.f;
++            // A plain blow (15 points) pushes 100 N s; twice the damage, 2^0.8 times as hard.
++            float limit = 240.f;
++            if (!hasHit)
++                blow.mPush = 130.f;
++            else if (cfg.mByStrength)
++            {
++                // ...and with the option, as far as the damage and the attacker's strength (50: plain) go.
++                blow.mPush = 100.f * std::pow(std::clamp(damage / 15.f, 0.2f, 8.f), 0.8f)
++                    * std::pow(std::clamp(hit.mAttackerStrength / 50.f, 0.3f, 6.f), 0.8f);
++                limit = 450.f;
++            }
++            else
++                blow.mPush = 100.f * std::clamp(std::pow(std::max(damage, 0.f) / 15.f, 0.8f), 0.4f, 3.f);
 +            blow.mPush *= cfg.mPush;
++            limit *= std::max(1.f, cfg.mPush);
++            if (hasHit && cfg.mMonsters && hit.mAttackerMonster)
++            {
++                blow.mPush *= cfg.mMonsterPower;
++                limit = std::max(limit, 250.f * cfg.mMonsterPower);
++                if (cfg.mMonsterPower >= 2.f)
++                    fall = true;
++            }
++            blow.mMaxPush = std::min(limit, 1200.f);
 +            blow.mHealth = health / maxHealth;
 +            blow.mFall = fall;
 +            blow.mGuard = cfg.mGuard;
@@ -1694,7 +1719,7 @@ index a07fe7204..72845868c 100644
          bool isRecovery() const;
          bool isSneaking() const;
 diff --git a/apps/openmw/mwmechanics/combat.cpp b/apps/openmw/mwmechanics/combat.cpp
-index dbb31f2a3..7ff5d060f 100644
+index dbb31f2a3..2f103ddb9 100644
 --- a/apps/openmw/mwmechanics/combat.cpp
 +++ b/apps/openmw/mwmechanics/combat.cpp
 @@ -32,6 +32,7 @@
@@ -1755,8 +1780,23 @@ index dbb31f2a3..7ff5d060f 100644
      }
  
      float getHitChance(const MWWorld::Ptr& attacker, const MWWorld::Ptr& victim, int skillValue)
+@@ -732,4 +748,14 @@ namespace MWMechanics
+         return true;
+     }
+ 
++
++    void getDeliriumAttacker(const MWWorld::Ptr& attacker, float& strength, bool& monster)
++    {
++        if (attacker.isEmpty() || !attacker.getClass().isActor())
++            return;
++        const CreatureStats& stats = attacker.getClass().getCreatureStats(attacker);
++        strength = stats.getAttribute(ESM::Attribute::Strength).getModified();
++        monster = stats.getMagicEffects().getOrDefault(ESM::MagicEffect::Vampirism).getMagnitude() > 0
++            || (attacker.getClass().isNpc() && attacker.getClass().getNpcStats(attacker).isWerewolf());
++    }
+ }
 diff --git a/apps/openmw/mwmechanics/combat.hpp b/apps/openmw/mwmechanics/combat.hpp
-index fa3660a01..189a46692 100644
+index fa3660a01..3280f5543 100644
 --- a/apps/openmw/mwmechanics/combat.hpp
 +++ b/apps/openmw/mwmechanics/combat.hpp
 @@ -33,8 +33,10 @@ namespace MWMechanics
@@ -1772,6 +1812,16 @@ index fa3660a01..189a46692 100644
  
      /// Get the chance (in percent) for \a attacker to successfully hit \a victim with a given weapon skill value
      float getHitChance(const MWWorld::Ptr& attacker, const MWWorld::Ptr& victim, int skillValue);
+@@ -72,6 +74,9 @@ namespace MWMechanics
+     std::pair<MWWorld::Ptr, osg::Vec3f> getHitContact(const MWWorld::Ptr& actor, float reach);
+ 
+     bool friendlyHit(const MWWorld::Ptr& attacker, const MWWorld::Ptr& target, bool complain);
++
++    /// Fisica (Delirium): the attacker's Strength, and whether it is a vampire or a werewolf.
++    void getDeliriumAttacker(const MWWorld::Ptr& attacker, float& strength, bool& monster);
+ }
+ 
+ #endif
 diff --git a/apps/openmw/mwmechanics/creaturestats.cpp b/apps/openmw/mwmechanics/creaturestats.cpp
 index 3531b7fde..0b7b344e8 100644
 --- a/apps/openmw/mwmechanics/creaturestats.cpp
@@ -1922,10 +1972,10 @@ index 4cf4c2e42..b1f66fe4d 100644
          enum Flag
 diff --git a/apps/openmw/mwmechanics/delirium.hpp b/apps/openmw/mwmechanics/delirium.hpp
 new file mode 100644
-index 000000000..60c85651d
+index 000000000..5328e0d06
 --- /dev/null
 +++ b/apps/openmw/mwmechanics/delirium.hpp
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,123 @@
 +#ifndef OPENMW_MWMECHANICS_DELIRIUM_H
 +#define OPENMW_MWMECHANICS_DELIRIUM_H
 +
@@ -1950,7 +2000,12 @@ index 000000000..60c85651d
 +        bool mKnockdowns = true; // the engine's knockdowns (and knockouts) are falls too
 +        float mGetUpTime = 1.5f; // seconds lying down before getting up
 +        bool mReal = true; // the real Delirium engine, where it is built in and the skeleton is a person's
-+        float mPush = 1.f; // how hard blows push (the real engine)
++        float mPush = 1.f; // how hard blows push (the real engine): the level of the reactions
++        // The push follows the attacker's strength and the damage all the way (off: the damage only, and tamely).
++        bool mByStrength = false;
++        // A vampire's or a werewolf's blows throw people about (theirs times mMonsterPower).
++        bool mMonsters = false;
++        float mMonsterPower = 3.f;
 +        bool mDeaths = true; // deaths are Delirium's too (the real engine)
 +        bool mGuard = false; // light hits: the flinch with the hands up (off: it only takes the blow and steps)
 +        // "Precision": the blow lands where the swing goes (a chop from above on the head and shoulders, a slash
@@ -2008,6 +2063,8 @@ index 000000000..60c85651d
 +        osg::Vec3f mPoint; // where it hit, or zero
 +        osg::Vec3f mPush; // the way the blow goes (unit, with its up or down), or zero: away
 +        float mStrength = 0; // health taken / max health
++        float mAttackerStrength = 50; // the attacker's Strength attribute
++        bool mAttackerMonster = false; // a vampire or a werewolf did it (in melee)
 +        bool mPending = false;
 +    };
 +
@@ -2110,7 +2167,7 @@ index 000000000..04528c771
 +};
 diff --git a/apps/openmw/mwmechanics/deliriumbody.cpp b/apps/openmw/mwmechanics/deliriumbody.cpp
 new file mode 100644
-index 000000000..44b8875bc
+index 000000000..ddd68c07a
 --- /dev/null
 +++ b/apps/openmw/mwmechanics/deliriumbody.cpp
 @@ -0,0 +1,745 @@
@@ -2730,7 +2787,7 @@ index 000000000..44b8875bc
 +        // As Skyrim Delirium's reaction table for a weapon's blow: a light one flinches (guard up, turned to whoever
 +        // did it), a harder one is GTA's shot reaction (wounded where it landed, fighting to stay on its feet,
 +        // steps to catch itself), and past what the steps can catch it falls. On the ground it only takes the push.
-+        constexpr float flinchBelow = 55.f, maxPush = 160.f, plainPush = 45.f;
++        constexpr float flinchBelow = 40.f, plainPush = 45.f;
 +        float at[3] = {}, q[4] = {};
 +        int part = sChest;
 +        if (blow.mPoint)
@@ -2747,7 +2804,7 @@ index 000000000..44b8875bc
 +        }
 +        const V3 direction{ blow.mDirection.x(), blow.mDirection.y(), blow.mDirection.z() };
 +        const bool pushes = M::len(direction) > 0.5f;
-+        const float want = std::min(blow.mPush, maxPush);
++        const float want = std::min(blow.mPush, blow.mMaxPush);
 +        if (mDown || mDying)
 +        {
 +            if (pushes)
@@ -2861,10 +2918,10 @@ index 000000000..44b8875bc
 +}
 diff --git a/apps/openmw/mwmechanics/deliriumbody.hpp b/apps/openmw/mwmechanics/deliriumbody.hpp
 new file mode 100644
-index 000000000..2ee40ee5f
+index 000000000..7d9b1e794
 --- /dev/null
 +++ b/apps/openmw/mwmechanics/deliriumbody.hpp
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,143 @@
 +#ifndef OPENMW_MWMECHANICS_DELIRIUMBODY_H
 +#define OPENMW_MWMECHANICS_DELIRIUMBODY_H
 +
@@ -2930,6 +2987,7 @@ index 000000000..2ee40ee5f
 +            std::optional<osg::Vec3f> mPoint; // where it landed (world), else the chest
 +            osg::Vec3f mDirection; // the way it pushes (unit; zero: none)
 +            float mPush = 0; // N s
++            float mMaxPush = 240; // N s
 +            float mHealth = 1; // what is left of its health (0-1)
 +            bool mFall = false; // it must go down
 +            bool mGuard = false; // a light one: the flinch with the hands up
