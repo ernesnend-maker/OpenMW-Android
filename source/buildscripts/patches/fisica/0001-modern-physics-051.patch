@@ -26,7 +26,7 @@ index 3fc1b8321..f31a20645 100644
      include(cmake/CheckBulletPrecision.cmake)
      if (HAS_DOUBLE_PRECISION_BULLET)
 diff --git a/apps/openmw/CMakeLists.txt b/apps/openmw/CMakeLists.txt
-index 17c4e96b1..4dfb43ec7 100644
+index 17c4e96b1..ffa293874 100644
 --- a/apps/openmw/CMakeLists.txt
 +++ b/apps/openmw/CMakeLists.txt
 @@ -81,7 +81,7 @@ add_openmw_dir (mwworld
@@ -47,15 +47,34 @@ index 17c4e96b1..4dfb43ec7 100644
      )
  
  add_openmw_dir (mwclass
-@@ -104,7 +104,7 @@ add_openmw_dir (mwmechanics
+@@ -103,8 +103,8 @@ add_openmw_dir (mwmechanics
+     drawstate spells activespells npcstats aipackage aisequence aipursue alchemy aiwander aitravel aifollow aiavoiddoor aibreathe
      aicast aiescort aiface aiactivate aicombat recharge repair enchanting pathfinding pathgrid security spellcasting spellresistance
      disease pickpocket levelledlist combat steering obstacle autocalcspell difficultyscaling aicombataction summoning
-     character actors objects aistate weaponpriority spellpriority weapontype spellutil
+-    character actors objects aistate weaponpriority spellpriority weapontype spellutil
 -    spelleffects
++    character deliriumbody actors objects aistate weaponpriority spellpriority weapontype spellutil
 +    spelleffects stuckprojectiles
      )
  
  add_openmw_dir (mwstate
+@@ -168,6 +168,16 @@ include_directories(
+     ${FFmpeg_INCLUDE_DIRS}
+ )
+ 
++# Fisica: the real Delirium engine (a static library built from PVCPC/delirium-physics, Rust). Without it the
++# engine builds as before and Delirium falls back to the simpler reactions.
++set(FISICA_DELIRIUM_LIB "" CACHE FILEPATH "libdelirium_physics.a (delirium-sdk built as a static library)")
++if (FISICA_DELIRIUM_LIB)
++    message(STATUS "Fisica: Delirium engine from ${FISICA_DELIRIUM_LIB}")
++    target_compile_definitions(openmw-lib PRIVATE FISICA_DELIRIUM)
++    target_include_directories(openmw-lib PRIVATE ${CMAKE_SOURCE_DIR}/extern/delirium)
++    target_link_libraries(openmw-lib ${FISICA_DELIRIUM_LIB} ${CMAKE_DL_LIBS})
++endif()
++
+ target_link_libraries(openmw-lib
+     # CMake's built-in OSG finder does not use pkgconfig, so we have to
+     # manually ensure the order is correct for inter-library dependencies.
 diff --git a/apps/openmw/mwbase/soundmanager.hpp b/apps/openmw/mwbase/soundmanager.hpp
 index 9b6b579c2..bd1f18e2c 100644
 --- a/apps/openmw/mwbase/soundmanager.hpp
@@ -82,7 +101,7 @@ index 9b6b579c2..bd1f18e2c 100644
          ///< Stop the given sound from playing
  
 diff --git a/apps/openmw/mwbase/world.hpp b/apps/openmw/mwbase/world.hpp
-index 819c4ac91..89bd6f0d7 100644
+index 819c4ac91..d67a8407c 100644
 --- a/apps/openmw/mwbase/world.hpp
 +++ b/apps/openmw/mwbase/world.hpp
 @@ -6,9 +6,13 @@
@@ -107,7 +126,7 @@ index 819c4ac91..89bd6f0d7 100644
      struct Movement;
  }
  
-@@ -287,6 +292,48 @@ namespace MWBase
+@@ -287,6 +292,50 @@ namespace MWBase
  
          virtual void scaleObject(const MWWorld::Ptr& ptr, float scale, bool force = false) = 0;
  
@@ -135,6 +154,8 @@ index 819c4ac91..89bd6f0d7 100644
 +        virtual void removeRagdoll(const MWWorld::ConstPtr& actor) = 0;
 +        /// Fisica (Delirium): a living actor thrown down (a hard hit): a jointed ragdoll whose muscles fade from
 +        /// tone to toneEnd over seconds. @return false if it can't have one (no skeleton, or in one piece).
++        /// Fisica (Delirium): the world's collision around center, as triangles (three vertices each).
++        virtual std::vector<osg::Vec3f> getStaticTriangles(const osg::Vec3f& center, float radius, float height) const = 0;
 +        virtual bool makeLiveRagdoll(
 +            const MWWorld::Ptr& actor, const osg::Vec3f& kick, const MWMechanics::RagdollMuscles& muscles)
 +            = 0;
@@ -526,14 +547,15 @@ index 270f6e1e4..b64853c1e 100644
              sol::optional<sol::table> damageLua = options.get<sol::optional<sol::table>>("damage");
              std::map<std::string, float> damageCpp;
 diff --git a/apps/openmw/mwlua/worldbindings.cpp b/apps/openmw/mwlua/worldbindings.cpp
-index 531460423..b1203ad95 100644
+index 531460423..62aeccb2f 100644
 --- a/apps/openmw/mwlua/worldbindings.cpp
 +++ b/apps/openmw/mwlua/worldbindings.cpp
-@@ -24,11 +24,17 @@
+@@ -24,11 +24,18 @@
  #include "../mwbase/statemanager.hpp"
  #include "../mwbase/windowmanager.hpp"
  #include "../mwbase/world.hpp"
 +#include "../mwmechanics/creaturestats.hpp"
++#include "../mwmechanics/deliriumbody.hpp"
 +#include "../mwmechanics/stuckprojectiles.hpp"
 +#include "../mwrender/animation.hpp"
 +
@@ -547,7 +569,7 @@ index 531460423..b1203ad95 100644
  #include "../mwworld/store.hpp"
  #include "../mwworld/worldmodel.hpp"
  
-@@ -253,6 +259,159 @@ namespace MWLua
+@@ -253,6 +260,163 @@ namespace MWLua
                  return MWBase::Environment::get().getESMStore()->insert(light);
              });
  
@@ -601,6 +623,9 @@ index 531460423..b1203ad95 100644
 +            cfg.mKnockdowns = options.get_or("knockdowns", cfg.mKnockdowns);
 +            cfg.mGetUpTime = std::clamp(options.get_or("getUpTime", cfg.mGetUpTime), 0.3f, 10.f);
 +            cfg.mDebug = options.get_or("debug", cfg.mDebug);
++            cfg.mReal = options.get_or("real", cfg.mReal);
++            cfg.mPush = std::clamp(options.get_or("push", cfg.mPush), 0.f, 4.f);
++            cfg.mDeaths = options.get_or("deaths", cfg.mDeaths);
 +            if (sol::optional<sol::table> tune = options["tune"])
 +                for (const auto& [key, value] : *tune)
 +                {
@@ -609,6 +634,7 @@ index 531460423..b1203ad95 100644
 +                        cfg.mTune[index] = value.as<float>();
 +                }
 +        };
++        api["hasDeliriumEngine"] = []() { return MWMechanics::DeliriumBody::available(); };
 +        api["takeDeliriumEvents"] = [](sol::this_state lua) {
 +            MWMechanics::DeliriumConfig& cfg = MWMechanics::deliriumConfig();
 +            sol::table events(lua, sol::create);
@@ -758,7 +784,7 @@ index 61a148b7e..e778a172d 100644
          ++mDeathCount[actor.getCellRef().getRefId()];
  
 diff --git a/apps/openmw/mwmechanics/character.cpp b/apps/openmw/mwmechanics/character.cpp
-index 664f293fb..651c1ddf7 100644
+index 664f293fb..c8a8419b2 100644
 --- a/apps/openmw/mwmechanics/character.cpp
 +++ b/apps/openmw/mwmechanics/character.cpp
 @@ -50,7 +50,9 @@
@@ -798,20 +824,25 @@ index 664f293fb..651c1ddf7 100644
          playDeath(startpoint, mDeathState);
      }
  
-@@ -1996,6 +2018,12 @@ namespace MWMechanics
+@@ -1994,8 +2016,17 @@ namespace MWMechanics
+             cls.getCreatureStats(mPtr).setTeleported(false);
+         }
  
++        mDeliriumDuration = duration;
          if (!cls.isActor())
              updateAnimQueue();
 +        else if (mLiveRagdoll && !cls.getCreatureStats(mPtr).isDead())
 +            updateLiveRagdoll(duration); // Fisica (Delirium): down, the ragdoll drives the bones
 +        else if (!cls.getCreatureStats(mPtr).isDead() && updateDelirium())
 +        {
-+            // Fisica (Delirium): thrown down this frame
++            // Fisica (Delirium): thrown down this frame, or the real engine has the body
++            if (mDelirium != nullptr)
++                updateDeliriumBody(duration);
 +        }
          else if (!cls.getCreatureStats(mPtr).isDead())
          {
              bool onground = world->isOnGround(mPtr);
-@@ -2437,6 +2465,15 @@ namespace MWMechanics
+@@ -2437,6 +2468,15 @@ namespace MWMechanics
          }
          else if (cls.getCreatureStats(mPtr).isDead())
          {
@@ -827,7 +858,7 @@ index 664f293fb..651c1ddf7 100644
              // initial start of death animation for actors that started the game as dead
              // not done in constructor since we need to give scripts a chance to set the mSkipAnim flag
              if (!mSkipAnim && mDeathState != CharState_None && mCurrentDeath.empty())
-@@ -2447,6 +2484,18 @@ namespace MWMechanics
+@@ -2447,6 +2487,18 @@ namespace MWMechanics
              }
          }
  
@@ -846,7 +877,7 @@ index 664f293fb..651c1ddf7 100644
          osg::Vec3f movementFromAnimation
              = mAnimation->runAnimation(mSkipAnim && !isScriptedAnimPlaying() ? 0.f : duration);
  
-@@ -2780,7 +2829,9 @@ namespace MWMechanics
+@@ -2780,7 +2832,9 @@ namespace MWMechanics
      {
          if (mDeathState == CharState_None)
          {
@@ -856,10 +887,11 @@ index 664f293fb..651c1ddf7 100644
              resetCurrentIdleState();
              return Result_DeathAnimStarted;
          }
-@@ -2798,6 +2849,13 @@ namespace MWMechanics
+@@ -2798,6 +2852,14 @@ namespace MWMechanics
  
      void CharacterController::resurrect()
      {
++        mDelirium.reset();
 +        if (mRagdoll)
 +        {
 +            MWBase::Environment::get().getWorld()->removeRagdoll(mPtr);
@@ -870,7 +902,7 @@ index 664f293fb..651c1ddf7 100644
          if (mDeathState == CharState_None)
              return;
  
-@@ -2805,6 +2863,396 @@ namespace MWMechanics
+@@ -2805,6 +2867,650 @@ namespace MWMechanics
          mWeaponType = ESM::Weapon::None;
      }
  
@@ -879,6 +911,26 @@ index 664f293fb..651c1ddf7 100644
 +        // Anyone with a skeleton; the rest play their death animation. Not the player (the death camera).
 +        if (!mAnimation || mPtr == getPlayer())
 +            return false;
++        {
++            // The real Delirium engine plays the death: the killing blow, the fall, then limp (see driveRagdoll).
++            const DeliriumConfig& cfg = deliriumConfig();
++            CreatureStats& stats = mPtr.getClass().getCreatureStats(mPtr);
++            if (mDelirium != nullptr && !(cfg.mEnabled && cfg.mReal && cfg.mDeaths))
++                endDeliriumBody();
++            if (cfg.mEnabled && cfg.mReal && cfg.mDeaths && !stats.isDeliriumBlocked()
++                && (mDelirium != nullptr || (canUseDeliriumBody() && startDeliriumBody(true))))
++            {
++                osg::Vec3f away = stats.getDeathKick();
++                stats.setDeathKick(osg::Vec3f());
++                away.z() = 0;
++                if (away.normalize() <= 0)
++                    away = osg::Vec3f();
++                mDelirium->die(away);
++                deliriumEvent(std::string(mPtr.getClass().getName(mPtr)) + ": MUERE con Delirium");
++                mRagdoll = true;
++                return true;
++            }
++        }
 +        if (mLiveRagdoll)
 +        {
 +            // Dies while down (Delirium): the same ragdoll goes on, now limp.
@@ -974,10 +1026,72 @@ index 664f293fb..651c1ddf7 100644
 +        const bool knockout = stats.getFatigue().getCurrent() < 0 || stats.getFatigue().getBase() == 0;
 +        const bool alreadyDown = mHitState == CharState_KnockDown || mHitState == CharState_KnockOut
 +            || mHitState == CharState_SwimKnockDown || mHitState == CharState_SwimKnockOut;
-+        if (!hasHit && !((knockdown || knockout) && !alreadyDown))
-+            return false;
 +        const DeliriumConfig& cfg = deliriumConfig();
 +        const std::string name(mPtr.getClass().getName(mPtr));
++        if (mDelirium != nullptr || (cfg.mEnabled && cfg.mReal && canUseDeliriumBody()))
++        {
++            // The real engine: every blow goes to its body (made at the first one), which reacts by itself.
++            if (const char* reason = deliriumIneligibleReason())
++            {
++                if (mDelirium != nullptr)
++                    endDeliriumBody();
++                if (hasHit && cfg.mEnabled)
++                    deliriumEvent(name + ": nada (" + reason + ")");
++                return false;
++            }
++            const bool down = mDelirium != nullptr && mDelirium->isDown();
++            // (Once: the engine's knockdown stays on while it is down.)
++            const bool knocked = (knockdown || knockout) && !mDeliriumKnocked;
++            mDeliriumKnocked = knockdown || knockout;
++            bool fall = cfg.mKnockdowns && knocked && !alreadyDown && !down;
++            if (hasHit && cfg.mFallThreshold > 0 && hit.mStrength >= cfg.mFallThreshold)
++                fall = true;
++            if (!hasHit && !fall)
++                return mDelirium != nullptr;
++            if (mDelirium == nullptr)
++            {
++                MWBase::World* world = MWBase::Environment::get().getWorld();
++                const char* blocked = world->isSwimming(mPtr) ? "nadando"
++                    : world->isFlying(mPtr) ? "volando"
++                    : alreadyDown ? "ya esta derribado"
++                    : nullptr;
++                if (blocked != nullptr)
++                {
++                    deliriumEvent(name + ": nada (" + blocked + ")");
++                    return false;
++                }
++                if (isScriptedAnimPlaying())
++                    mAnimQueue.clear();
++                if (!startDeliriumBody(false))
++                {
++                    deliriumEvent(name + ": el motor no pudo tomar el cuerpo (" + DeliriumBody::lastError() + ")");
++                    return false;
++                }
++            }
++            const osg::Vec3f position = mPtr.getRefData().getPosition().asVec3();
++            DeliriumBody::Blow blow;
++            blow.mDirection = hit.mAway;
++            if (blow.mDirection.length2() < 0.01f && !hasHit)
++                blow.mDirection = osg::Quat(mPtr.getRefData().getPosition().rot[2], osg::Vec3f(0, 0, -1)) * osg::Vec3f(0, -1, 0);
++            if (hit.mPoint.length2() > 1.f)
++                blow.mPoint = hit.mPoint;
++            if (hit.mAway.length2() > 0.01f)
++                blow.mFrom = position - hit.mAway * 80.f + osg::Vec3f(0, 0, 110.f);
++            // A plain blow (15 points) pushes 45 N s; twice the damage, 2^0.8 times as hard.
++            const float damage = hit.mStrength * maxHealth;
++            blow.mPush = hasHit ? 45.f * std::clamp(std::pow(std::max(damage, 0.f) / 15.f, 0.8f), 0.4f, 3.f) : 110.f;
++            blow.mPush *= cfg.mPush;
++            blow.mHealth = health / maxHealth;
++            blow.mFall = fall;
++            deliriumEvent(name + ": " + mDelirium->hit(blow));
++            if (cfg.mReplaceHits || fall)
++                stats.setHitRecovery(false);
++            if (!fall)
++                stats.setKnockedDown(false);
++            return true;
++        }
++        if (!hasHit && !((knockdown || knockout) && !alreadyDown))
++            return false;
 +        if (const char* reason = deliriumIneligibleReason())
 +        {
 +            if (hasHit && cfg.mEnabled)
@@ -1074,6 +1188,160 @@ index 664f293fb..651c1ddf7 100644
 +        mAnimation->setFlinch(osg::Quat());
 +        world->setActorCollisionMode(mPtr, true, false);
 +        return true;
++    }
++
++    bool CharacterController::canUseDeliriumBody() const
++    {
++        // People (its body is a person's, made for their skeleton). The rest keep the simpler reactions.
++        return mAnimation != nullptr && mPtr != getPlayer() && mPtr.getClass().isNpc() && DeliriumBody::available()
++            && mAnimation->getBoneWorldMatrix("Bip01 Spine2").has_value();
++    }
++
++    bool CharacterController::startDeliriumBody(bool dying)
++    {
++        MWBase::World* world = MWBase::Environment::get().getWorld();
++        SceneUtil::PositionAttitudeTransform* base = mPtr.getRefData().getBaseNode();
++        if (base == nullptr || mAnimation == nullptr)
++            return false;
++        osg::Matrix baseWorld;
++        base->computeLocalToWorldMatrix(baseWorld, nullptr);
++        const osg::Matrixf baseMatrix(baseWorld);
++        bool isBeast = false;
++        if (mPtr.getClass().isNpc())
++        {
++            const ESM::NPC* npc = mPtr.get<ESM::NPC>()->mBase;
++            const ESM::Race* race = world->getStore().get<ESM::Race>().find(npc->mRace);
++            isBeast = (race->mData.mFlags & ESM::Race::Beast) != 0;
++        }
++        const ESM::Position& position = mPtr.getRefData().getPosition();
++        mDelirium = DeliriumBody::create(
++            [this](std::string_view bone) { return mAnimation->getBoneWorldMatrix(bone); }, baseMatrix,
++            position.asVec3(), position.rot[2], isBeast, dying);
++        if (mDelirium == nullptr)
++            return false;
++        mDeliriumWorldTimer = 0;
++        gatherDeliriumWorld();
++        // As for a knockdown: whatever it was doing ends.
++        CreatureStats& stats = mPtr.getClass().getCreatureStats(mPtr);
++        stats.setHitRecovery(false);
++        if (!dying)
++        {
++            if (!mCurrentWeapon.empty())
++                mAnimation->disable(mCurrentWeapon);
++            if (mUpperBodyState > UpperBodyState::WeaponEquipped)
++            {
++                mUpperBodyState = UpperBodyState::WeaponEquipped;
++                if (mWeaponType > ESM::Weapon::None)
++                    mAnimation->showWeapons(true);
++            }
++            else if (mUpperBodyState < UpperBodyState::WeaponEquipped)
++                mUpperBodyState = UpperBodyState::None;
++            mHitState = CharState_None;
++            mCurrentHit.clear();
++            resetCurrentMovementState();
++            resetCurrentIdleState();
++            resetCurrentJumpState();
++            mAnimation->stopAllAnimations();
++        }
++        mFlinchAngle = mFlinchSpeed = osg::Vec2f();
++        mFlinching = false;
++        mAnimation->setFlinch(osg::Quat());
++        return true;
++    }
++
++    void CharacterController::gatherDeliriumWorld()
++    {
++        // What is around it (ground, walls, stairs, furniture), for its own little world.
++        MWBase::World* world = MWBase::Environment::get().getWorld();
++        const osg::Vec3f center = mDelirium->getPelvisPosition();
++        mLiveRagdollLast = center;
++        const std::vector<osg::Vec3f> triangles = world->getStaticTriangles(center, 450.f, 300.f);
++        if (std::getenv("FISICA_NOMESH") == nullptr)
++            mDelirium->setWorld(triangles);
++        if (deliriumConfig().mDebug)
++            Log(Debug::Info) << "Delirium: world of " << triangles.size() / 3 << " triangles";
++    }
++
++    std::vector<std::pair<std::string, osg::Matrixf>> CharacterController::writeDeliriumBones()
++    {
++        MWBase::World* world = MWBase::Environment::get().getWorld();
++        // The actor goes where its body goes (under the pelvis); the bones are then put where the parts are.
++        const osg::Vec3f pelvis = mDelirium->getPelvisPosition();
++        const osg::Vec3f position = mPtr.getRefData().getPosition().asVec3();
++        if ((osg::Vec2f(pelvis.x(), pelvis.y()) - osg::Vec2f(position.x(), position.y())).length2() > 4.f)
++            world->moveObject(mPtr, osg::Vec3f(pelvis.x(), pelvis.y(), position.z()));
++        std::vector<std::pair<std::string, osg::Matrixf>> poses = mDelirium->getBonePoses();
++        for (const auto& [bone, matrix] : poses)
++            mAnimation->setBoneWorldMatrix(bone, matrix);
++        // Far from where its world was gathered: a new one around it.
++        if ((pelvis - mLiveRagdollLast).length2() > 180.f * 180.f)
++            gatherDeliriumWorld();
++        return poses;
++    }
++
++    void CharacterController::updateDeliriumBody(float duration)
++    {
++        MWBase::World* world = MWBase::Environment::get().getWorld();
++        CreatureStats& stats = mPtr.getClass().getCreatureStats(mPtr);
++        const std::string name(mPtr.getClass().getName(mPtr));
++        mDelirium->step(duration);
++        if (mDelirium->isBroken())
++        {
++            deliriumEvent(name + ": el motor fallo (" + DeliriumBody::lastError() + ")");
++            endDeliriumBody();
++            return;
++        }
++        // An animation a mod started meanwhile would take the bones back.
++        if (mAnimation->hasActiveAnimations())
++            mAnimation->stopAllAnimations();
++        const std::vector<std::pair<std::string, osg::Matrixf>> poses = writeDeliriumBones();
++        if (deliriumConfig().mDebug && static_cast<int>(mDelirium->getAge() * 4) != static_cast<int>((mDelirium->getAge() - duration) * 4))
++            Log(Debug::Info) << "Delirium: " << name << " age " << mDelirium->getAge() << " pelvis "
++                             << mDelirium->getPelvisPosition() << " head " << mDelirium->getHeadHeight() << " down "
++                             << mDelirium->isDown() << " calm " << mDelirium->getCalmTime() << " still "
++                             << mDelirium->getStillTime();
++        if (mDelirium->isDown())
++        {
++            stats.setKnockedDown(true);
++            world->setActorCollisionMode(mPtr, true, false);
++            const bool knockout = stats.getFatigue().getCurrent() < 0 || stats.getFatigue().getBase() == 0;
++            if (knockout)
++                mDelirium->relax();
++            const float getUpTime = deliriumConfig().mGetUpTime;
++            const float downTime = mDelirium->getDownTime();
++            if (!knockout
++                && ((mDelirium->getStillTime() > 0.4f && downTime > getUpTime) || downTime > getUpTime + 5.f))
++            {
++                mDelirium.reset();
++                getUpFromRagdoll(poses);
++            }
++        }
++        else if (mDelirium->getCalmTime() > 0.45f || mDelirium->getAge() > 15.f)
++        {
++            deliriumEvent(name + ": se recupera de pie");
++            endDeliriumBody();
++        }
++    }
++
++    void CharacterController::endDeliriumBody()
++    {
++        if (mDelirium == nullptr)
++            return;
++        MWBase::World* world = MWBase::Environment::get().getWorld();
++        const std::vector<std::pair<std::string, osg::Matrixf>> poses = mDelirium->getBonePoses();
++        const osg::Vec3f facing = mDelirium->getFacing();
++        const bool down = mDelirium->isDown();
++        mDelirium.reset();
++        world->setActorCollisionMode(mPtr, true, true);
++        if (down)
++        {
++            mPtr.getClass().getCreatureStats(mPtr).setKnockedDown(false);
++            return;
++        }
++        // Back to its animation from the pose it was left in, facing the way the body turned.
++        const ESM::Position& pos = mPtr.getRefData().getPosition();
++        world->rotateObject(mPtr, osg::Vec3f(pos.rot[0], pos.rot[1], std::atan2(facing.x(), facing.y())));
++        mAnimation->blendFromPose(poses, 0.35f);
 +    }
 +
 +    void CharacterController::updateLiveRagdoll(float duration)
@@ -1196,6 +1464,24 @@ index 664f293fb..651c1ddf7 100644
 +
 +    void CharacterController::driveRagdoll()
 +    {
++        if (mDelirium != nullptr)
++        {
++            // Dying in Delirium; once it lies still its body is an ordinary (sleeping) ragdoll, to be dragged about.
++            mDelirium->step(mDeliriumDuration);
++            const bool broken = mDelirium->isBroken();
++            if (!broken)
++            {
++                std::vector<std::pair<std::string, osg::Matrixf>> poses = writeDeliriumBones();
++                mPtr.getClass().getCreatureStats(mPtr).setRagdollPose(std::move(poses));
++            }
++            if (broken || (mDelirium->isDown() && mDelirium->getStillTime() > 1.2f && mDelirium->getAge() > 3.f)
++                || mDelirium->getAge() > 10.f)
++            {
++                mDelirium.reset();
++                MWBase::Environment::get().getWorld()->makeRagdoll(mPtr, osg::Vec3f(), false, !broken);
++            }
++            return;
++        }
 +        const std::vector<std::pair<std::string, osg::Matrixf>> poses
 +            = MWBase::Environment::get().getWorld()->getRagdollBonePoses(mPtr);
 +        if (poses.empty())
@@ -1268,10 +1554,19 @@ index 664f293fb..651c1ddf7 100644
      {
          // Keeping track of when to stop a continuous VFX seems to be very difficult to do inside the spells code,
 diff --git a/apps/openmw/mwmechanics/character.hpp b/apps/openmw/mwmechanics/character.hpp
-index a07fe7204..62ab99a97 100644
+index a07fe7204..caa1616a4 100644
 --- a/apps/openmw/mwmechanics/character.hpp
 +++ b/apps/openmw/mwmechanics/character.hpp
-@@ -163,6 +163,18 @@ namespace MWMechanics
+@@ -9,6 +9,8 @@
+ 
+ #include "../mwrender/animation.hpp"
+ 
++#include "deliriumbody.hpp"
++
+ namespace MWWorld
+ {
+     class InventoryStore;
+@@ -163,6 +165,23 @@ namespace MWMechanics
          std::string mCurrentHit;
  
          UpperBodyState mUpperBodyState{ UpperBodyState::None };
@@ -1286,11 +1581,16 @@ index a07fe7204..62ab99a97 100644
 +        osg::Vec2f mFlinchSpeed;
 +        bool mFlinching = false;
 +        float mDeliriumHealth = -1; // last frame's, to see health lost without a hit
++        // The real Delirium engine has the body (deliriumbody.hpp): from a hit until it is steady again, or got up.
++        std::unique_ptr<DeliriumBody> mDelirium;
++        float mDeliriumDuration = 0; // this frame's
++        float mDeliriumWorldTimer = 0;
++        bool mDeliriumKnocked = false; // last frame's knockdown or knockout
 +        bool mDying = false; // in kill()
          bool mResetIdleOnAttackEnd{ false };
  
          JumpingState mJumpState{ JumpState_None };
-@@ -231,6 +243,18 @@ namespace MWMechanics
+@@ -231,6 +250,24 @@ namespace MWMechanics
          void updateMagicEffects() const;
  
          void playDeath(float startpoint, CharacterState death);
@@ -1301,6 +1601,12 @@ index a07fe7204..62ab99a97 100644
 +        bool updateDelirium(); // a hit (or knockdown) this frame: bend or fall; true if it fell
 +        bool canFallDown() const;
 +        bool startLiveRagdoll(const osg::Vec3f& kick);
++        bool canUseDeliriumBody() const;
++        bool startDeliriumBody(bool dying);
++        void updateDeliriumBody(float duration);
++        void gatherDeliriumWorld();
++        std::vector<std::pair<std::string, osg::Matrixf>> writeDeliriumBones();
++        void endDeliriumBody();
 +        void updateLiveRagdoll(float duration);
 +        void getUpFromRagdoll(const std::vector<std::pair<std::string, osg::Matrixf>>& poses);
 +        void updateFlinch(float duration);
@@ -1309,11 +1615,11 @@ index a07fe7204..62ab99a97 100644
          CharacterState chooseRandomDeathState() const;
          void playRandomDeath(float startpoint = 0.0f);
  
-@@ -311,6 +335,7 @@ namespace MWMechanics
+@@ -311,6 +348,7 @@ namespace MWMechanics
          bool isCastingSpell() const;
          bool isReadyToBlock() const;
          bool isKnockedDown() const;
-+        bool isLiveRagdoll() const { return mLiveRagdoll; }
++        bool isLiveRagdoll() const { return mLiveRagdoll || (mDelirium != nullptr && mDelirium->isDown()); }
          bool isKnockedOut() const;
          bool isRecovery() const;
          bool isSneaking() const;
@@ -1535,10 +1841,10 @@ index 4cf4c2e42..39ecf2baf 100644
          enum Flag
 diff --git a/apps/openmw/mwmechanics/delirium.hpp b/apps/openmw/mwmechanics/delirium.hpp
 new file mode 100644
-index 000000000..8bb8cf94e
+index 000000000..75939833e
 --- /dev/null
 +++ b/apps/openmw/mwmechanics/delirium.hpp
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,81 @@
 +#ifndef OPENMW_MWMECHANICS_DELIRIUM_H
 +#define OPENMW_MWMECHANICS_DELIRIUM_H
 +
@@ -1562,6 +1868,9 @@ index 000000000..8bb8cf94e
 +        bool mReplaceHits = true; // light hits: no hit animation, only the bend
 +        bool mKnockdowns = true; // the engine's knockdowns (and knockouts) are falls too
 +        float mGetUpTime = 1.5f; // seconds lying down before getting up
++        bool mReal = true; // the real Delirium engine, where it is built in and the skeleton is a person's
++        float mPush = 1.f; // how hard blows push (the real engine)
++        bool mDeaths = true; // deaths are Delirium's too (the real engine)
 +        bool mDebug = false; // what it decides, for Lua to show (world.takeDeliriumEvents)
 +        // Tuning (world.setDelirium{tune = {...}}, 1-based there). See the names below.
 +        float mTune[32] = {
@@ -1613,6 +1922,970 @@ index 000000000..8bb8cf94e
 +        osg::Vec3f mPoint; // where it hit, or zero
 +        float mStrength = 0; // health taken / max health
 +        bool mPending = false;
++    };
++}
++
++#endif
+diff --git a/apps/openmw/mwmechanics/delirium_mw.inc b/apps/openmw/mwmechanics/delirium_mw.inc
+new file mode 100644
+index 000000000..04528c771
+--- /dev/null
++++ b/apps/openmw/mwmechanics/delirium_mw.inc
+@@ -0,0 +1,60 @@
++// Generated (PROYECTO/motor_fisica/delirium/hacer_inc.py): Delirium characters made for Morrowind's skeletons
++// (skyrim-delirium's make_character on base_anim.nif and base_animKnA.nif) and the rigs that put their parts on the bones.
++static const float kRigYaw = 1.5707976f;
++static const RigPart kRig[21] = {
++    { "Buttocks", "Bip01 Pelvis", "Bip01 Pelvis", "Bip01 Pelvis", true, { -0.7071063f, 0.0000005662441f, -0.0000006556511f, 0.7071073f }, { 0.0000000003448264f, -0.000000009874672f, 0.000000048428785f }, { 0.0f, 0.0f, 0.0f } },
++    { "Thigh_Left", "Bip01 L Thigh", "Bip01 L Thigh", "Bip01 L Thigh", true, { -0.5192676f, 0.5192676f, -0.47995967f, 0.47995955f }, { 0.000000003259629f, 0.23179916f, -0.000000017695129f }, { 0.000000003259629f, 0.09457406f, 0.000000052154064f } },
++    { "Shin_Left", "Bip01 L Calf", "Bip01 L Calf", "Bip01 L Calf", true, { -0.51926804f, 0.519268f, -0.47995907f, 0.4799591f }, { -0.0000000038417056f, 0.2668674f, 0.000000022351742f }, { 0.0000000037252903f, -0.23179922f, 0.000000018626451f } },
++    { "Foot_Left", "Bip01 L Foot", "Bip01 L Foot", "Bip01 L Foot", true, { -0.541675f, 0.5416752f, -0.4545191f, 0.45452017f }, { -0.0000000006656151f, 0.04500001f, 0.065000005f }, { -0.0000000038417056f, -0.26686743f, -0.000000023748726f } },
++    { "Thigh_Right", "Bip01 R Thigh", "Bip01 R Thigh", "Bip01 R Thigh", true, { -0.4451213f, 0.44512117f, -0.54942435f, 0.54942435f }, { 0.0000000004656613f, 0.23179911f, 0.0000000037252903f }, { -0.0000000040745363f, -0.09457408f, 0.000000044703484f } },
++    { "Shin_Right", "Bip01 R Calf", "Bip01 R Calf", "Bip01 R Calf", true, { -0.44580865f, 0.44580847f, -0.5488668f, 0.54886687f }, { -0.000000006519258f, 0.2668674f, -0.000000009313226f }, { -0.0000000004656613f, -0.23179911f, 0.0f } },
++    { "Foot_Right", "Bip01 R Foot", "Bip01 R Foot", "Bip01 R Foot", true, { -0.44259426f, 0.442595f, -0.55146104f, 0.5514625f }, { 0.0000000067849513f, 0.04500001f, 0.06500001f }, { -0.000000008381903f, -0.2668674f, 0.000000009313226f } },
++    { "Spine0", "Bip01 Spine", "Bip01 Spine", "Bip01 Spine", true, { 0.7166217f, 0.01178807f, -0.012224913f, -0.6972554f }, { -0.062310226f, -0.002047466f, 0.05996403f }, { 0.108697236f, 0.0037982576f, 0.0000959514f } },
++    { "Spine1", "Bip01 Spine1", "Bip01 Spine1", "Bip01 Spine1", true, { 0.71662384f, 0.0119133f, -0.012096196f, -0.6972532f }, { -0.08401616f, -0.0027837604f, 0.059963282f }, { 0.058155794f, 0.002047453f, 0.059964024f } },
++    { "Spine2", "Bip01 Spine2", "Bip01 Spine2", "Bip01 Spine2", false, { 0.7167304f, 0.011949778f, -0.0118864775f, -0.6971467f }, { -0.039879456f, -0.0012560785f, 0.059941772f }, { 0.07981875f, 0.0027837567f, 0.05996327f } },
++    { "Spine3", "Bip01 Spine2", "Bip01 Spine2", "Bip01 Neck", true, { 0.71673036f, 0.011949778f, -0.011886507f, -0.6971467f }, { -0.03943898f, -0.0012560841f, 0.04995147f }, { 0.03459381f, 0.0012560803f, 0.059941757f } },
++    { "Neck", "Bip01 Neck", "Bip01 Neck", "Bip01 Neck", true, { 0.50656664f, 0.5065667f, -0.49334598f, -0.493346f }, { 0.0f, -0.035465285f, -0.0000000041909516f }, { 0.03503428f, 0.0012560841f, 0.049951456f } },
++    { "Head", "Bip01 Head", "Bip01 Head", "Bip01 Head", true, { 0.53163135f, 0.46622902f, -0.53163004f, -0.4662275f }, { -0.000000000007219114f, -0.09000005f, 0.030000005f }, { 0.0f, 0.035465285f, 0.0000000004656613f } },
++    { "Clavicle_Left", "Bip01 L Clavicle", "Bip01 L Clavicle", "Bip01 L Clavicle", true, { -0.48767036f, 0.4876703f, -0.5120329f, 0.5120329f }, { 0.000000006519258f, 0.06830347f, 0.0f }, { 0.03391515f, 0.034350067f, 0.04980979f } },
++    { "Upper_Arm_Left", "Bip01 L UpperArm", "Bip01 L UpperArm", "Bip01 L UpperArm", true, { -0.5905911f, 0.5905911f, 0.38884735f, -0.3888472f }, { 0.000000009313226f, 0.1286834f, 0.0000000055879354f }, { -0.0000000009313226f, -0.06830348f, -0.0000000018626451f } },
++    { "Lower_Arm_Left", "Bip01 L Forearm", "Bip01 L Forearm", "Bip01 L Forearm", true, { -0.5900782f, 0.590078f, 0.38962537f, -0.3896253f }, { -0.000000005122274f, 0.12098525f, 0.0000000037252903f }, { 0.000000007450581f, -0.12868339f, -0.0000000055879354f } },
++    { "Hand_Left", "Bip01 L Hand", "Bip01 L Hand", "Bip01 L Hand", true, { 0.13635388f, -0.1474617f, -0.6649647f, 0.71936405f }, { -0.000000007916242f, 0.08000001f, -0.0000000027939677f }, { -0.000000003259629f, -0.12098513f, -0.000000015832484f } },
++    { "Clavicle_Right", "Bip01 R Clavicle", "Bip01 R Clavicle", "Bip01 R Clavicle", true, { 0.48767036f, -0.48767036f, -0.51203287f, 0.5120329f }, { -0.0000000027939677f, 0.068303496f, 0.000000007450581f }, { 0.036146387f, -0.03179518f, 0.05164304f } },
++    { "Upper_Arm_Right", "Bip01 R UpperArm", "Bip01 R UpperArm", "Bip01 R UpperArm", true, { 0.38909435f, -0.38909438f, -0.59042835f, 0.5904283f }, { 0.000000018626451f, 0.12868349f, 0.000000007450581f }, { 0.0000000027939677f, -0.068303496f, -0.000000007450581f } },
++    { "Lower_Arm_Right", "Bip01 R Forearm", "Bip01 R Forearm", "Bip01 R Forearm", true, { 0.38971323f, -0.38971317f, -0.59002f, 0.5900201f }, { -0.000000011641532f, 0.12098512f, 0.000000020489097f }, { 0.000000020489097f, -0.12868339f, 0.000000004656613f } },
++    { "Hand_Right", "Bip01 R Hand", "Bip01 R Hand", "Bip01 R Hand", true, { -0.6649852f, 0.71938586f, 0.13625495f, -0.14735465f }, { -0.000000010011718f, 0.07999995f, 0.000000011641532f }, { -0.000000015832484f, -0.12098524f, -0.000000011175871f } },
++};
++static const char* const kCharacter[] = {
++    R"DLRM({"format":"nm-character-1","joints":[{"name":"hip_left","index":0,"three":true,"pos":[-0.09428785,0.025669904,1.0944227],"twist_axis":[3.6379792e-12,6.894783e-08,-1.0],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.43633232,2.0943952],[-0.7853982,0.43633232],[-0.7853982,0.6981317]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[220.0,70.0]},{"name":"knee_left","index":1,"three":false,"pos":[-0.09428785,0.025669904,0.6308243],"twist_axis":[0.99939084,1.2703335e-06,-0.034899075],"lean_axis":[1.2703335e-06,-0.99939084,0.0],"limits":[[-2.5307274,0.052359954],[0.0,0.0],[0.0,0.0]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[200.0,0.0]},{"name":"ankle_left","index":2,"three":true,"pos":[-0.09428785,0.025669904,0.09708953],"twist_axis":[-1.2711079e-06,1.0,0.0],"lean_axis":[0.0,0.0,1.0],"limits":[[-0.9599311,0.7853982],[-0.29670596,0.29670596],[-0.38397244,0.38397244]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":18.0,"strength":81.0,"max_torque":[150.0,40.0]},{"name":"hip_right","index":3,"three":true,"pos":[0.09474507,0.025670145,1.0878216],"twist_axis":[-9.313226e-10,5.0935768e-08,-1.0],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.43633232,2.0943952],[-0.43633232,0.7853982],[-0.6981317,0.7853982]],"flip":[false,true,true],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[220.0,70.0]},{"name":"knee_right","index":4,"three":false,"pos":[0.09474507,0.025670145,0.62422335],"twist_axis":[0.99939084,1.2703335e-06,-0.034899075],"lean_axis":[1.2703335e-06,-0.99939084,0.0],"limits":[[-2.5307274,0.052359954],[0.0,0.0],[0.0,0.0]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[200.0,0.0]},{"name":"ankle_right","index":5,"three":true,"pos":[0.09474507,0.025670137,0.09048861],"twist_axis":[-1.2711079e-06,1.0,0.0],"lean_axis":[0.0,0.0,1.0],"limits":[[-0.9599311,0.7853982],[-0.29670596,0.29670596],[-0.38397244,0.38397244]],"flip":[false,true,true],"muscle_stiffness":1.0,"damping":18.0,"strength":81.0,"max_torque":[150.0,40.0]},{"name":"spine_0","index":6,"three":true,"pos":[0.00022608905,0.025574122,1.1998857],"twist_axis":[0.00090596953,0.03460037,0.99940085],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.2617994,0.43633232],[-0.17453292,0.17453292],[-0.08726646,0.08726646]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[220.0,90.0]},{"name":"spine_1","index":7,"three":true,"pos":[0.00033529062,0.029744698,1.3203491],"twist_axis":[0.0009153769,0.03495913,0.9993883],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.20943952,0.34906584],[-0.20943952,0.20943952],[-0.13962634,0.13962634]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[200.0,80.0]},{"name":"spine_2","index":8,"three":true,"pos":[0.00048534787,0.03547553,1.4841783],"twist_axis":[0.0011526699,0.044022147,0.99902993],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.17453292,0.2617994],[-0.20943952,0.20943952],[-0.2617994,0.2617994]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[180.0,70.0]},{"name":"spine_3","index":9,"three":true,"pos":[0.0005712398,0.038755868,1.5586216],"twist_axis":[0.0011526692,0.0440221,0.99902993],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.17453292,0.20943952],[-0.17453292,0.17453292],[-0.2617994,0.2617994]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[160.0,60.0]},{"name":"neck_lower","index":10,"three":true,"pos":[0.00065713166,0.0420362,1.633065],"twist_axis":[0.0036634938,0.13991304,0.990157],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.5235988,0.43633232],[-0.34906584,0.34906584],[-0.61086524,0.61086524]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":16.0,"strength":64.0,"max_torque":[50.0,25.0]},{"name":"neck_upper","index":11,"three":true,"pos":[0.00091698533,0.05196031,1.7032974],"twist_axis":[0.0,0.0,1.0],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.5235988,0.43633232],[-0.34906584,0.34906584],[-0.6981317,0.6981317]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":16.0,"strength":64.0,"max_torque":[40.0,20.0]},{"name":"clavicle_left","index":12,"three":true,"pos":[-0.03245593,0.042128395,1.6330963],"twist_axis":[-0.8954541,0.0040052193,-0.44513586],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.43633232,0.34906584],[-0.61086524,0.17453292],[-0.34906584,0.34906584]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[70.0,30.0]},{"name":"shoulder_left","index":13,"three":true,"pos":[-0.15478119,0.042675536,1.5722877],"twist_axis":[-0.8289532,-0.14848697,-0.53924793],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.87266463,1.9198622],[-1.134464,1.4835298],[-1.0471976,1.2217305]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[90.0,45.0]},{"name":"elbow_left","index":14,"three":false,"pos":[-0.3681262,0.004459925,1.4335032],"twist_axis":[0.55009437,-0.39080966,-0.7380136],"lean_axis":[-0.39080966,-0.55009437,0.0],"limits":[[-0.270579,2.2601483],[0.0,0.0],[0.0,0.0]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[75.0,0.0]},{"name":"wrist_left","index":15,"three":true,"pos":[-0.55486786,0.028590564,1.281533],"twist_axis":[-0.7717544,0.099725485,-0.62805253],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.5235988,0.43633232],[-1.0471976,1.0471976],[-0.6981317,0.6981317]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":18.0,"strength":81.0,"max_torque":[15.0,8.0]},{"name":"clavicle_right","index":16,"three":true,"pos":[0.033729643,0.04039529,1.6330963],"twist_axis":[0.89443666,-0.04286128,-0.44513577],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.43633232,0.34906584],[-0.17453292,0.61086524],[-0.34906584,0.34906584]],"flip":[false,true,true],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[70.0,30.0]},{"name":"shoulder_right","index":17,"three":true,"pos":[0.15591595,0.03454014,1.5722877],"twist_axis":[0.7936942,-0.12132528,-0.5960955],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.87266463,1.9198622],[-1.4835298,1.134464],[-1.2217305,1.0471976]],"flip":[false,true,true],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[90.0,45.0]},{"name":"elbow_right","index":18,"three":false,"pos":[0.36018652,0.003315026,1.4188725],"twist_axis":[0.59010947,0.3915108,0.70603836],"lean_axis":[0.3915108,-0.59010947,0.0],"limits":[[-0.270579,2.2601483],[0.0,0.0],[0.0,0.0]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[75.0,0.0]},{"name":"wrist_right","index":19,"three":true,"pos":[0.5406194,0.020456214,1.2585609],"twist_axis":[0.7456818,0.07084013,-0.6625257],"lean_axis":[-1.2711079e-06,1.0,0.0],"limits":[[-0.5235988,0.43633232],[-1.0471976,1.0471976],[-0.6981317,0.6981317]],"flip":[false,true,true],"muscle_stiffness":1.0,"damping":18.0,"strength":81.0,"max_torque":[15.0,8.0]}],"parts":[{"name":"Buttocks","frame":[[0.034899116,-0.99939084,1.2218952e-06],[5.9604645e-08,-1.1920929e-06,-1.0],[0.99939084,0.034899086,0.0],[0.00022860001,0.025670074,1.0911222]],"mass":11.36},{"name":"Thigh_Left","frame":[[1.0,-7.275958e-12,-8.5620006e-05],[-8.5620006e-05,-1.1920929e-07,-0.99999994],[-7.275958e-12,0.99999994,-1.1920929e-07],[-0.09428785,0.025669904,0.8626236]],"mass":8.0},{"name":"Shin_Left","frame":[[1.0,6.1409082e-09,-8.74231e-05],[-8.74231e-05,5.9604645e-08,-1.0],[-6.1336323e-09,1.0,5.9604645e-08],[-0.09428785,0.025669904,0.3639569]],"mass":3.72},{"name":"Foot_Left","frame":[[1.0,0.0,1.271108e-06],[1.271108e-06,-1.1920929e-07,-1.0000001],[0.0,1.0000001,-1.1920929e-07],[-0.09428793,0.0906699,0.052089527]],"mass":1.6},{"name":"Thigh_Right","frame":[[0.99997485,-2.561137e-09,0.00709509],[0.00709509,-1.1920929e-07,-0)DLRM",
++    R"DLRM(.9999749],[2.561137e-09,1.0000001,-1.1920929e-07],[0.09474507,0.025670148,0.8560225]],"mass":8.0},{"name":"Shin_Right","frame":[[0.99998945,7.916242e-09,0.0045918836],[0.0045918836,0.0,-0.9999895],[-7.916242e-09,1.0,0.0],[0.09474507,0.025670145,0.35735595]],"mass":3.72},{"name":"Foot_Right","frame":[[1.0,0.0,1.271108e-06],[1.271108e-06,-1.1920929e-07,-1.0000001],[0.0,1.0000001,-1.1920929e-07],[0.09474498,0.09067014,0.04548861]],"mass":1.6},{"name":"Spine0","frame":[[0.034878075,-0.9993909,0.0012094378],[0.034620345,-1.1920929e-06,-0.99940056],[0.99879175,0.034899056,0.034599185],[0.00028061357,0.0876594,1.2601174]],"mass":7.2},{"name":"Spine1","frame":[[0.034877658,-0.99939084,0.0012219548],[0.034979343,-1.1920929e-06,-0.99938804],[0.99877924,0.034899056,0.034958005],[0.000410243,0.09261011,1.4022636]],"mass":6.4},{"name":"Spine2","frame":[[0.03486514,-0.99939084,0.0015384853],[0.044047117,-1.3113022e-06,-0.9990294],[0.99842083,0.034899086,0.044020236],[0.0005282176,0.097115695,1.5214]],"mass":5.6},{"name":"Spine3","frame":[[0.03486526,-0.9993908,0.0015384257],[0.044047058,-1.1920929e-06,-0.9990294],[0.99842083,0.034899145,0.044020236],[0.00061412214,0.09039603,1.5958433]],"mass":5.92},{"name":"Neck","frame":[[0.99999315,0.0036634943,0.0005189461],[1.2710225e-06,0.13991302,-0.99016386],[-0.0037000668,0.99015707,0.13991207],[0.0007870585,0.046998255,1.6681812]],"mass":0.96},{"name":"Head","frame":[[1.0,0.0,1.271108e-06],[1.271108e-06,-1.1920929e-07,-1.0000001],[0.0,1.0000001,-1.1920929e-07],[0.0009169472,0.08196031,1.7932974]],"mass":5.52},{"name":"Clavicle_Left","frame":[[-0.4451313,0.8954541,0.0044727623],[0.001990974,-0.0040051937,0.99999],[0.8954631,0.44513583,5.9604645e-08],[-0.09361856,0.042401966,1.602692]],"mass":1.2},{"name":"Upper_Arm_Left","frame":[[0.5452927,0.82895327,0.12446895],[6.854534e-07,0.14848691,-0.98891443],[-0.83824575,0.53924793,0.08096826],[-0.2614537,0.02356773,1.5028955]],"mass":2.24},{"name":"Lower_Arm_Left","frame":[[0.6311991,0.7717545,-0.07734865],[7.748604e-07,-0.099725604,-0.99501514],[-0.77562094,0.6280527,-0.06294739],[-0.4614971,0.016525244,1.3575181]],"mass":1.28},{"name":"Hand_Left","frame":[[0.6311991,0.7717545,-0.07734868],[8.046627e-07,-0.099725604,-0.99501514],[-0.77562094,0.6280526,-0.06294739],[-0.61660826,0.03656861,1.2312888]],"mass":0.48},{"name":"Clavicle_Right","frame":[[0.44462556,-0.8944368,-0.047865003],[-0.021306336,0.042861283,-0.9988539],[0.8954631,0.44513586,0.0],[0.094822794,0.037467714,1.602692]],"mass":1.2},{"name":"Upper_Arm_Right","frame":[[0.6005317,-0.7936942,-0.09701139],[7.1525574e-07,0.121325254,-0.9926129],[0.79960096,0.5960955,0.07286018],[0.25805128,0.018927582,1.49558]],"mass":2.24},{"name":"Lower_Arm_Right","frame":[[0.6641942,-0.7456819,0.052957654],[8.34465e-07,-0.07083988,-0.99748766],[0.74756,0.66252565,-0.047050834],[0.45040295,0.011885619,1.3387167]],"mass":1.28},{"name":"Hand_Right","frame":[[0.66419435,-0.7456819,0.052957684],[8.046627e-07,-0.07084012,-0.9974878],[0.74756,0.6625258,-0.047050953],[0.60027397,0.026123412,1.2055589]],"mass":0.48}],"self_collision":[[0,15],[7,15],[8,15],[9,15],[10,15],[0,16],[7,16],[8,16],[9,16],[10,16],[0,14],[7,14],[8,14],[1,14],[2,14],[4,14],[5,14],[12,14],[1,15],[2,15],[4,15],[5,15],[12,15],[1,16],[2,16],[4,16],[5,16],[12,16],[0,19],[7,19],[8,19],[9,19],[10,19],[0,20],[7,20],[8,20],[9,20],[10,20],[0,18],[7,18],[8,18],[1,18],[2,18],[4,18],[5,18],[12,18],[1,19],[2,19],[4,19],[5,19],[12,19],[1,20],[2,20],[4,20],[5,20],[12,20],[15,19],[15,20],[16,19],[16,20],[1,4],[1,5],[1,6],[2,4],[2,5],[2,6],[3,4],[3,5],[3,6],[1,8],[1,9],[1,10],[4,8],[4,9],[4,10],[2,7],[2,8],[2,9],[2,10],[2,12],[3,7],[3,8],[3,9],[3,10],[3,12],[5,7],[5,8],[5,9],[5,10],[5,12],[6,7],[6,8],[6,9],[6,10],[6,12],[1,12],[4,12]],"build":[{"name":"Buttocks","parent":null,"mass":11.36,"radius":0.11,"half":0.06,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.0,0.0,0.0],"anchor":[3.448264e-10,-9.874672e-09,4.8428785e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.50865024,-0.49119744,0.49119806,0.50864965],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.00022860001,0.025670074,1.0911222],"rot":[0.50865024,-0.49119744,0.49119806,0.50864965]}},{"name":"Thigh_Left","parent":0,"mass":8.0,"radius":0.075,"half":0.17179918,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[3.259629e-09,0.09457406,5.2154064e-08],"anchor":[3.259629e-09,0.23179916,-1.7695129e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.700179,-0.0031839684,0.0031234296,0.71395344],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.092220515,0.021154605,0.86267674],"rot":[0.700179,-0.0031839684,0.0031234296,0.71395344]}},{"name":"Shin_Left","parent":1,"mass":3.72,"radius":0.055,"half":0.22286737,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[3.7252903e-09,-0.23179922,1.8626451e-08],"anchor":[-3.8417056e-09,0.2668674,2.2351742e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.69977117,-0.00321788,0.003153085,0.7143529],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.08774912,0.011136302,0.3641309],"rot":[0.69977117,-0.00321788,0.003153085,0.7143529]}},{"name":"Foot_Left","parent":2,"mass":1.6,"radius":0.04,"half":0.0,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-3.8417056e-09,-0.26686743,-2.3748726e-08],"anchor":[-6.656151e-10,0.04500001,0.065000005],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.7071068,4.4940452e-07,4.4940452e-07,0.7071068],"boxed":[0.05,0.04,0.135],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.085345164,0.0706333,0.052331083],"rot":[0.7071068,4.4940452e-07,4.4940452e-07,0.7071068]}},{"name":"Thigh_Right","parent":0,"mass":8.0,"radius":0.075,"half":0.1717991,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-4.0745363e-09,-0.09457408,4.4703484e-08],"anchor":[4.656613e-10,0.23179911,3.7252903e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.7622936,-0.027690666,0.032686047,0.6458122],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.11431701,0.06375929,0.86001253],"rot":[0.7622936,-0.027690666,0.032686047,0.6458122]}},{"name":"Shin_Right","parent":4,"mass":3.72,"radius":0.055,"half":0.22286737,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-4.656613e-10,-0.23179911,0.0],"anchor":[-6.519258e-09,0.2668674,-9.313226e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.68540174,-0.013933103,0.013120249,0.7279136],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.14408338,0.08580844,0.3660137],"rot":[0.68540174,-0.013933103,0.013120249,0.7279136]}},{"name":"Foot_Right","parent":5,"mass":1.6,"radius":0.04,"half":0.0,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-8.381903e-09,-0.2668674,9.313226e-09],"anchor":[6.7849513e-09,0.04500001,0.06500001],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.7071068,4.4940452e-07,4.4940452e-07,0.7071068],"boxed":[0.05,0.04,0.135],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.15427771,0.13476846,0.05482395],"rot":[0.7071068,4.4940452e-07,4.4940452e-07,0.7071068]}},{"name":"Spine0","parent":0,"mass":7.2,"radius":0.1,"half":0.05,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.108697236,0.0037982576,9.59514e-05],"anchor":[-0.062310226,-0.002047466,0.05996403],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.50007004,-0.48231772,0.4999306,0.5170774],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.00028061357,0.0876594,1.2601174],"rot":[0.50007004,-0.48231772,0.4999306,0.5170774]}},{"name":"Spine1","parent":7,"mass":6.4,"radius":0.1,"half":0.06,"offset":{"pos":[0.0,0.0,0.0],")DLRM",
++    R"DLRM(rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.058155794,0.002047453,0.059964024],"anchor":[-0.08401616,-0.0027837604,0.059963282],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.4999802,-0.48222482,0.5000204,0.517164],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.000410243,0.09261011,1.4022636],"rot":[0.4999802,-0.48222482,0.5000204,0.517164]}},{"name":"Spine2","parent":8,"mass":5.6,"radius":0.105,"half":0.065,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.07981875,0.0027837567,0.05996327],"anchor":[-0.039879456,-0.0012560785,0.059941772],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.4977063,-0.47987324,0.5022839,0.5193467],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.0005282176,0.097115695,1.5214],"rot":[0.4977063,-0.47987324,0.5022839,0.5193467]}},{"name":"Spine3","parent":9,"mass":5.92,"radius":0.1,"half":0.08,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.03459381,0.0012560803,0.059941757],"anchor":[-0.03943898,-0.0012560841,0.04995147],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.4977063,-0.47987324,0.5022838,0.5193467],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.00061412214,0.09039603,1.5958433],"rot":[0.4977063,-0.47987324,0.5022838,0.5193467]}},{"name":"Neck","parent":10,"mass":0.96,"radius":0.06,"half":0.03546528,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.03503428,0.0012560841,0.049951456],"anchor":[0.0,-0.035465285,-4.1909516e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.6557759,0.0013971104,-0.0012127316,0.7549534],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.0007870585,0.046998255,1.6681812],"rot":[0.6557759,0.0013971104,-0.0012127316,0.7549534]}},{"name":"Head","parent":11,"mass":5.52,"radius":0.085,"half":0.03,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.0,0.035465285,4.656613e-10],"anchor":[-7.219114e-12,-0.09000005,0.030000005],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.7071068,4.4940452e-07,4.4940452e-07,0.7071068],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.0009169472,0.08196031,1.7932974],"rot":[0.7071068,4.4940452e-07,4.4940452e-07,0.7071068]}},{"name":"Clavicle_Left","parent":10,"mass":1.2,"radius":0.04,"half":0.03630348,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.03391515,0.034350067,0.04980979],"anchor":[6.519258e-09,0.06830347,0.0],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.3737893,0.60023457,0.60190046,-0.37110087],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.09361856,0.042401966,1.602692],"rot":[0.3737893,0.60023457,0.60190046,-0.37110087]}},{"name":"Upper_Arm_Left","parent":13,"mass":2.24,"radius":0.048,"half":0.09028339,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-9.313226e-10,-0.06830348,-1.8626451e-09],"anchor":[9.313226e-09,0.1286834,5.5879354e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":true,"bind":[0.64997584,0.066598006,-0.057344005,0.7548561],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.17706236,0.023567839,1.4469966],"rot":[0.64997584,0.066598006,-0.057344005,0.7548561]}},{"name":"Lower_Arm_Left","parent":14,"mass":1.28,"radius":0.04,"half":0.08898519,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[7.450581e-09,-0.12868339,-5.5879354e-09],"anchor":[-5.122274e-09,0.12098525,3.7252903e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":true,"bind":[0.7410782,0.023355715,-0.025812639,0.6705157],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.20771961,0.016525568,1.2016151],"rot":[0.7410782,0.023355715,-0.025812639,0.6705157]}},{"name":"Hand_Left","parent":15,"mass":0.48,"radius":0.03,"half":0.0,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-3.259629e-09,-0.12098513,-1.5832484e-08],"anchor":[-7.916242e-09,0.08000001,-2.7939677e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.7410782,0.02335571,-0.02581263,0.67051566],"boxed":[0.03,0.08,0.045],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.22163428,0.036569115,1.0021166],"rot":[0.7410782,0.02335571,-0.02581263,0.67051566]}},{"name":"Clavicle_Right","parent":10,"mass":1.2,"radius":0.04,"half":0.036303494,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.036146387,-0.03179518,0.05164304],"anchor":[-2.7939677e-09,0.068303496,7.450581e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.59198064,-0.3867285,0.35795012,0.6098129],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.094822794,0.037467714,1.602692],"rot":[0.59198064,-0.3867285,0.35795012,0.6098129]}},{"name":"Upper_Arm_Right","parent":17,"mass":2.24,"radius":0.048,"half":0.09028343,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[2.7939677e-09,-0.068303496,-7.450581e-09],"anchor":[1.8626451e-08,0.12868349,7.450581e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":true,"bind":[0.6598074,-0.07136697,0.06317582,0.74536556],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.18015411,0.018927483,1.4468756],"rot":[0.6598074,-0.07136697,0.06317582,0.74536556]}},{"name":"Lower_Arm_Right","parent":18,"mass":1.28,"radius":0.04,"half":0.088985175,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[2.0489097e-08,-0.12868339,4.656613e-09],"anchor":[-1.1641532e-08,0.12098512,2.0489097e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":true,"bind":[0.7306439,-0.037014358,0.039737176,0.68059564],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.2174803,0.011885324,1.2014942],"rot":[0.7306439,-0.037014358,0.039737176,0.68059564]}},{"name":"Hand_Right","parent":19,"mass":0.48,"radius":0.03,"half":0.0,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-1.5832484e-08,-0.12098524,-1.1175871e-08],"anchor":[-1.0011718e-08,0.07999995,1.1641532e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.7306439,-0.03701434,0.039737158,0.68059564],"boxed":[0.03,0.08,0.045],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.23922257,0.026122954,1.0021964],"rot":[0.7306439,-0.03701434,0.039737158,0.68059564]}}]})DLRM",
++};
++static const float kRigYawBeast = 1.5707974f;
++static const RigPart kRigBeast[21] = {
++    { "Buttocks", "Bip01 Pelvis", "Bip01 Pelvis", "Bip01 Pelvis", true, { -0.7071063f, 0.0000005364418f, -0.00000047683716f, 0.7071073f }, { -0.00000011920929f, -0.00000000059890937f, 0.000000052154064f }, { 0.0f, 0.0f, 0.0f } },
++    { "Thigh_Left", "Bip01 L Thigh", "Bip01 L Thigh", "Bip01 L Thigh", true, { -0.5524342f, 0.552434f, -0.44138026f, 0.44138017f }, { -0.00000000896398f, 0.23309308f, -0.000000007450581f }, { -0.00000012293451f, 0.094574064f, 0.000000044703484f } },
++    { "Shin_Left", "Bip01 L Calf", "Bip01 L Calf", "Bip01 L Calf", true, { -0.55328465f, 0.55328465f, -0.44031373f, 0.44031355f }, { -0.00000000023283064f, 0.26529813f, -0.000000007450581f }, { -0.0000000031432137f, -0.23309308f, 0.0f } },
++    { "Foot_Left", "Bip01 L Foot", "Bip01 L Foot", "Bip01 L Foot", true, { -0.65930384f, 0.3805683f, -0.60564685f, 0.23168527f }, { -0.0000000010248868f, 0.04500001f, 0.065000005f }, { 0.00000000023283064f, -0.2652981f, 0.000000014901161f } },
++    { "Thigh_Right", "Bip01 R Thigh", "Bip01 R Thigh", "Bip01 R Thigh", true, { -0.44138026f, 0.44138f, -0.5524344f, 0.5524342f }, { 0.000000004307367f, 0.23309296f, -0.000000014901161f }, { -0.00000011362128f, -0.094574064f, 0.000000063329935f } },
++    { "Shin_Right", "Bip01 R Calf", "Bip01 R Calf", "Bip01 R Calf", true, { -0.44031334f, 0.44031325f, -0.5532849f, 0.55328494f }, { 0.000000007450581f, 0.2652981f, 0.000000022351742f }, { 0.0000000052386895f, -0.23309302f, 0.000000052154064f } },
++    { "Foot_Right", "Bip01 R Foot", "Bip01 R Foot", "Bip01 R Foot", true, { -0.60564697f, 0.23168533f, -0.6593038f, 0.38056847f }, { -0.0000000010248868f, 0.04500001f, 0.065000005f }, { 0.0000000073341653f, -0.26529807f, -0.000000007450581f } },
++    { "Spine0", "Bip01 Spine", "Bip01 Spine", "Bip01 Spine", true, { 0.70710766f, -0.00037699938f, -0.00037693977f, -0.70710576f }, { -0.06653468f, 0.0000000018626451f, 0.05967301f }, { 0.10877013f, -0.0000000037252903f, 0.000095493524f } },
++    { "Spine1", "Bip01 Spine1", "Bip01 Spine1", "Bip01 Spine1", true, { 0.70710766f, -0.00025588274f, -0.00025585294f, -0.7071059f }, { -0.09850468f, -0.000000011175871f, 0.05767449f }, { 0.05402352f, -0.0000000018626451f, 0.059673008f } },
++    { "Spine2", "Bip01 Spine2", "Bip01 Spine2", "Bip01 Spine2", false, { 0.7071078f, -0.00013405085f, -0.00013396144f, -0.7071058f }, { -0.051796082f, 0.0f, 0.05821169f }, { 0.06541972f, -0.0000000037252903f, 0.057674482f } },
++    { "Spine3", "Bip01 Spine2", "Bip01 Spine2", "Bip01 Neck", true, { 0.7071078f, -0.00013405086f, -0.00013399126f, -0.7071058f }, { -0.04937281f, 0.0f, 0.04850974f }, { 0.022716895f, -0.0000000018626451f, 0.05821169f } },
++    { "Neck", "Bip01 Neck", "Bip01 Neck", "Bip01 Neck", true, { 0.5000007f, 0.5000007f, -0.49999928f, -0.49999934f }, { 0.000000000000013322676f, -0.035465308f, -0.00000002142042f }, { 0.025140159f, -0.0000000018626451f, 0.048509747f } },
++    { "Head", "Bip01 Head", "Bip01 Head", "Bip01 Head", true, { 0.5495255f, 0.44499785f, -0.54952425f, -0.44499633f }, { 0.0f, -0.09000005f, 0.030000005f }, { 0.00000000000001687539f, 0.035465192f, -0.000000022351742f } },
++    { "Clavicle_Left", "Bip01 L Clavicle", "Bip01 L Clavicle", "Bip01 L Clavicle", true, { -0.42961216f, 0.42961225f, -0.56163454f, 0.56163454f }, { 0.000000004656613f, 0.06830345f, 0.0000000037252903f }, { 0.025142696f, 0.03310412f, 0.049284704f } },
++    { "Upper_Arm_Left", "Bip01 L UpperArm", "Bip01 L UpperArm", "Bip01 L UpperArm", true, { -0.6013787f, 0.6013786f, 0.3719458f, -0.37194592f }, { 0.000000011175871f, 0.12868333f, -0.000000020489097f }, { -0.000000004656613f, -0.06830345f, -0.0000000037252903f } },
++    { "Lower_Arm_Left", "Bip01 L Forearm", "Bip01 L Forearm", "Bip01 L Forearm", true, { -0.60507745f, 0.6050774f, 0.36589807f, -0.365898f }, { -0.00000000034924597f, 0.12098516f, -0.000000007450581f }, { 0.000000026077032f, -0.12868345f, -0.000000013038516f } },
++    { "Hand_Left", "Bip01 L Hand", "Bip01 L Hand", "Bip01 L Hand", true, { 0.16567497f, -0.17304194f, -0.67137337f, 0.70133173f }, { 0.000000008265488f, 0.07999996f, 0.000000018626451f }, { 0.00000000023283064f, -0.12098516f, 0.0f } },
++    { "Clavicle_Right", "Bip01 R Clavicle", "Bip01 R Clavicle", "Bip01 R Clavicle", true, { 0.42961225f, -0.42961216f, -0.5616346f, 0.56163454f }, { -0.000000007450581f, 0.06830346f, 0.000000007450581f }, { 0.02514268f, -0.03310413f, 0.049284782f } },
++    { "Upper_Arm_Right", "Bip01 R UpperArm", "Bip01 R UpperArm", "Bip01 R UpperArm", true, { 0.42141283f, -0.42141283f, -0.5678126f, 0.5678127f }, { -0.000000018626451f, 0.12868336f, -0.000000033527613f }, { 0.000000007450581f, -0.06830346f, -0.000000007450581f } },
++    { "Lower_Arm_Right", "Bip01 R Forearm", "Bip01 R Forearm", "Bip01 R Forearm", true, { 0.4335865f, -0.43358645f, -0.55857205f, 0.55857205f }, { 0.0000000018626451f, 0.12098518f, -0.0000000037252903f }, { -0.000000018626451f, -0.12868343f, -0.000000040978193f } },
++    { "Hand_Right", "Bip01 R Hand", "Bip01 R Hand", "Bip01 R Hand", true, { -0.6589606f, 0.7267089f, 0.13535094f, -0.13908775f }, { 0.000000015483238f, 0.08000003f, -0.000000011175871f }, { -0.0000000018626451f, -0.12098518f, 0.0000000037252903f } },
++};
++static const char* const kCharacterBeast[] = {
++    R"DLRM({"format":"nm-character-1","joints":[{"name":"hip_left","index":0,"three":true,"pos":[-0.094574064,0.041500695,1.0694687],"twist_axis":[1.4901159e-08,-6.986272e-08,-1.0],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.43633232,2.0943952],[-0.7853982,0.43633232],[-0.7853982,0.6981317]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[220.0,70.0]},{"name":"knee_left","index":1,"three":false,"pos":[-0.094574064,0.041500725,0.6032827],"twist_axis":[1.0,1.1620107e-06,-0.0],"lean_axis":[1.1620107e-06,-1.0,0.0],"limits":[[-2.5307276,0.052359574],[0.0,0.0],[0.0,0.0]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[200.0,0.0]},{"name":"ankle_left","index":2,"three":true,"pos":[-0.094574064,0.04150074,0.07268667],"twist_axis":[-1.1620107e-06,1.0,0.0],"lean_axis":[0.0,0.0,1.0],"limits":[[-0.9599311,0.7853982],[-0.29670596,0.29670596],[-0.38397244,0.38397244]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":18.0,"strength":81.0,"max_torque":[150.0,40.0]},{"name":"hip_right","index":3,"three":true,"pos":[0.094574064,0.041500915,1.0694687],"twist_axis":[-2.2351745e-08,-2.2627948e-08,-1.0],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.43633232,2.0943952],[-0.43633232,0.7853982],[-0.6981317,0.7853982]],"flip":[false,true,true],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[220.0,70.0]},{"name":"knee_right","index":4,"three":false,"pos":[0.09457407,0.04150093,0.6032828],"twist_axis":[1.0,1.1620107e-06,-0.0],"lean_axis":[1.1620107e-06,-1.0,0.0],"limits":[[-2.5307276,0.052359574],[0.0,0.0],[0.0,0.0]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[200.0,0.0]},{"name":"ankle_right","index":5,"three":true,"pos":[0.094574064,0.04150093,0.07268673],"twist_axis":[-1.1620107e-06,1.0,0.0],"lean_axis":[0.0,0.0,1.0],"limits":[[-0.9599311,0.7853982],[-0.29670596,0.29670596],[-0.38397244,0.38397244]],"flip":[false,true,true],"muscle_stiffness":1.0,"damping":18.0,"strength":81.0,"max_torque":[150.0,40.0]},{"name":"spine_0","index":6,"three":true,"pos":[4.2678296e-09,0.04140537,1.178239],"twist_axis":[-7.9157786e-08,0.104259714,0.9945501],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.2617994,0.43633232],[-0.17453292,0.17453292],[-0.08726646,0.08726646]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[220.0,90.0]},{"name":"spine_1","index":7,"three":true,"pos":[-5.2752913e-09,0.053974733,1.2981402],"twist_axis":[-2.8226864e-07,0.27570707,0.9612417],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.20943952,0.34906584],[-0.20943952,0.20943952],[-0.13962634,0.13962634]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[200.0,80.0]},{"name":"spine_2","index":8,"three":true,"pos":[-5.1546007e-08,0.09916984,1.4557111],"twist_axis":[-2.4261558e-07,0.24232659,0.97019464],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.17453292,0.2617994],[-0.20943952,0.20943952],[-0.2617994,0.2617994]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[180.0,70.0]},{"name":"spine_3","index":9,"three":true,"pos":[-6.9624015e-08,0.11722632,1.5280032],"twist_axis":[-2.4261564e-07,0.2423265,0.97019476],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.17453292,0.20943952],[-0.17453292,0.17453292],[-0.2617994,0.2617994]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":24.0,"strength":144.0,"max_torque":[160.0,60.0]},{"name":"neck_lower","index":10,"three":true,"pos":[-8.770203e-08,0.13528278,1.6002953],"twist_axis":[-2.430527e-07,0.2426944,0.9701028],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.5235988,0.43633232],[-0.34906584,0.34906584],[-0.61086524,0.61086524]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":16.0,"strength":64.0,"max_torque":[50.0,25.0]},{"name":"neck_upper","index":11,"three":true,"pos":[-1.04941876e-07,0.15249722,1.6691052],"twist_axis":[0.0,0.0,1.0],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.5235988,0.43633232],[-0.34906584,0.34906584],[-0.6981317,0.6981317]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":16.0,"strength":64.0,"max_torque":[40.0,20.0]},{"name":"clavicle_left","index":12,"three":true,"pos":[-0.03310421,0.1345315,1.6004856],"twist_axis":[-0.9193945,-0.09515777,-0.38165295],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.43633232,0.34906584],[-0.61086524,0.17453292],[-0.34906584,0.34906584]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[70.0,30.0]},{"name":"shoulder_left","index":13,"three":true,"pos":[-0.15869983,0.12153229,1.5483491],"twist_axis":[-0.7933574,-0.24897215,-0.55551505],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.87266463,1.9198622],[-1.134464,1.4835298],[-1.0471976,1.2217305]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[90.0,45.0]},{"name":"elbow_left","index":14,"three":false,"pos":[-0.36288363,0.057455137,1.4053781],"twist_axis":[0.6042786,-0.43256035,-0.6691329],"lean_axis":[-0.43256035,-0.6042786,0.0],"limits":[[-0.695696,1.8350314],[0.0,0.0],[0.0,0.0]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[75.0,0.0]},{"name":"wrist_left","index":15,"three":true,"pos":[-0.49881107,0.14559871,1.2256447],"twist_axis":[-0.5617526,0.36427444,-0.7427908],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.5235988,0.43633232],[-1.0471976,1.0471976],[-0.6981317,0.6981317]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":18.0,"strength":81.0,"max_torque":[15.0,8.0]},{"name":"clavicle_right","index":16,"three":true,"pos":[0.033104036,0.1345315,1.6004856],"twist_axis":[0.9193947,-0.0951558,-0.38165292],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.43633232,0.34906584],[-0.17453292,0.61086524],[-0.34906584,0.34906584]],"flip":[false,true,true],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[70.0,30.0]},{"name":"shoulder_right","index":17,"three":true,"pos":[0.15869969,0.12153256,1.5483491],"twist_axis":[0.66321033,-0.58694047,-0.46438444],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.87266463,1.9198622],[-1.4835298,1.134464],[-1.2217305,1.0471976]],"flip":[false,true,true],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[90.0,45.0]},{"name":"elbow_right","index":18,"three":false,"pos":[0.32938802,-0.029526412,1.428832],"twist_axis":[0.68824893,0.23450577,0.68652785],"lean_axis":[0.23450577,-0.68824893,0.0],"limits":[[-0.695696,1.8350314],[0.0,0.0],[0.0,0.0]],"flip":[false,false,false],"muscle_stiffness":1.0,"damping":20.0,"strength":100.0,"max_torque":[75.0,0.0]},{"name":"wrist_right","index":19,"three":true,"pos":[0.47695696,0.04923431,1.2539898],"twist_axis":[0.60986394,0.32549745,-0.7225769],"lean_axis":[-1.1620107e-06,1.0,0.0],"limits":[[-0.5235988,0.43633232],[-1.0471976,1.0471976],[-0.6981317,0.6981317]],"flip":[false,true,true],"muscle_stiffness":1.0,"damping":18.0,"strength":81.0,"max_torque":[15.0,8.0]}],"parts":[{"name":"Buttocks","frame":[[0.0,-1.0,1.1920929e-06],[0.0,-1.1920929e-06,-1.0],[1.0,0.0,0.0],[-5.9897065e-10,0.04150086,1.0694689]],"mass":11.36},{"name":"Thigh_Left","frame":[[0.9975966,2.2351742e-08,-0.06928936],[-0.06928936,0.0,-0.9975967],[-1.4901161e-08,1.0000001,0.0],[-0.094574064,0.041500703,0.8363757]],"mass":8.0},{"name":"Shin_Left","frame":[[0.99732184,0.0,-0.07313798],[-0.07313798,-2.3841858e-07,-0.99732184],[-2.2351742e-08,1.0,-2.3841858e-07],[-0.094574064,0.041500732,0.33798468]],"mass":3.72},{"name":"Foot_Left","frame":[[1.0,0.0,1.1620108e-06],[1.1620108e-06,-1.1920929e-07,-1.0000001],[0.0,1.0000001,-1.1920929e-07],[-0.09457414,0.10650074,0.02768667]],"mass":1.6},{"name":"Thigh_Right","frame":[[0.99759644,1.8626451e-08,0.06929144],[0.06929144,-1.1920929e-07,-0.99759644],[-1.1175871e-08,0.99999994,-1.1920929e-07],[0.094574064,0.041500937,0.836375)DLRM",
++    R"DLRM(8]],"mass":8.0},{"name":"Shin_Right","frame":[[0.9973216,-1.8626451e-08,0.073140725],[0.073140725,-1.1920929e-07,-0.9973216],[3.3527613e-08,1.0,-1.1920929e-07],[0.094574064,0.041500974,0.33798468]],"mass":3.72},{"name":"Foot_Right","frame":[[1.0,0.0,1.1620108e-06],[1.1620108e-06,-1.1920929e-07,-1.0000001],[0.0,1.0000001,-1.1920929e-07],[0.09457399,0.10650092,0.02768673]],"mass":1.6},{"name":"Spine0","frame":[[-1.1920929e-07,-1.0,1.1622906e-06],[0.10425976,-1.1920929e-06,-0.9945501],[0.9945501,2.9802322e-08,0.10425979],[-7.0224374e-08,0.10769005,1.2381896]],"mass":7.2},{"name":"Spine1","frame":[[-3.5762787e-07,-1.0,1.0430813e-06],[0.27570698,-1.1920929e-06,-0.9612417],[0.9612417,2.9802322e-08,0.275707],[-9.8131295e-08,0.13657229,1.3769257]],"mass":6.4},{"name":"Spine2","frame":[[-4.7683716e-07,-1.0000001,1.1324883e-06],[0.24232659,-1.3113022e-06,-0.9701949],[0.9701949,0.0,0.2423265],[-1.3030565e-07,0.16819808,1.4918572]],"mass":5.6},{"name":"Spine3","frame":[[-2.3841858e-07,-1.0,1.1622906e-06],[0.24232647,-1.1920929e-06,-0.9701948],[0.9701948,-2.9802322e-08,0.2423265],[-1.3676356e-07,0.17625456,1.5641493]],"mass":5.92},{"name":"Neck","frame":[[1.0,-2.430527e-07,1.1370169e-06],[1.1620108e-06,0.24269432,-0.97010285],[-4.0161467e-08,0.97010285,0.24269432],[-9.6321955e-08,0.14389,1.6347003]],"mass":0.96},{"name":"Head","frame":[[1.0,0.0,1.1620108e-06],[1.1620108e-06,-1.1920929e-07,-1.0000001],[0.0,1.0000001,-1.1920929e-07],[-1.398022e-07,0.18249722,1.7591052]],"mass":5.52},{"name":"Clavicle_Left","frame":[[-0.37962508,0.91939443,-0.10295048],[-0.03929138,0.09515768,0.9946866],[0.9243058,0.38165298,0.0],[-0.09590202,0.1280319,1.5744174]],"mass":1.2},{"name":"Upper_Arm_Left","frame":[[0.5735764,0.79335743,0.20394638],[7.1525574e-07,0.24897206,-0.96851075],[-0.8191521,0.55551505,0.1428039],[-0.2607917,0.089493714,1.4768636]],"mass":2.24},{"name":"Lower_Arm_Left","frame":[[0.7975923,0.5617526,-0.2197285],[9.536743e-07,-0.3642745,-0.93129176],[-0.603197,0.7427909,-0.29054308],[-0.43084735,0.10152692,1.3155113]],"mass":1.28},{"name":"Hand_Left","frame":[[0.7975922,0.5617526,-0.21972856],[9.536743e-07,-0.3642745,-0.93129164],[-0.603197,0.74279076,-0.29054308],[-0.54375124,0.17474066,1.1662215]],"mass":0.48},{"name":"Clavicle_Right","frame":[[0.37962508,-0.9193946,-0.10294843],[-0.039290518,0.095155835,-0.9946867],[0.9243057,0.38165298,0.0],[0.09590186,0.12803203,1.5744174]],"mass":1.2},{"name":"Upper_Arm_Right","frame":[[0.57357657,-0.6632103,-0.48079312],[6.854534e-07,0.5869405,-0.80963],[0.8191519,0.46438438,0.3366558],[0.24404381,0.04600306,1.4885906]],"mass":2.24},{"name":"Lower_Arm_Right","frame":[[0.76419246,-0.60986394,0.20994268],[8.940697e-07,-0.3254975,-0.94554293],[0.6449883,0.722577,-0.24874222],[0.4031725,0.009853937,1.3414109]],"mass":1.28},{"name":"Hand_Right","frame":[[0.76419246,-0.6098639,0.20994277],[9.23872e-07,-0.3254975,-0.9455429],[0.64498836,0.7225769,-0.2487421],[0.5257461,0.07527411,1.1961837]],"mass":0.48}],"self_collision":[[0,15],[7,15],[8,15],[9,15],[10,15],[0,16],[7,16],[8,16],[9,16],[10,16],[0,14],[7,14],[8,14],[1,14],[2,14],[4,14],[5,14],[12,14],[1,15],[2,15],[4,15],[5,15],[12,15],[1,16],[2,16],[4,16],[5,16],[12,16],[0,19],[7,19],[8,19],[9,19],[10,19],[0,20],[7,20],[8,20],[9,20],[10,20],[0,18],[7,18],[8,18],[1,18],[2,18],[4,18],[5,18],[12,18],[1,19],[2,19],[4,19],[5,19],[12,19],[1,20],[2,20],[4,20],[5,20],[12,20],[15,19],[15,20],[16,19],[16,20],[1,4],[1,5],[1,6],[2,4],[2,5],[2,6],[3,4],[3,5],[3,6],[1,8],[1,9],[1,10],[4,8],[4,9],[4,10],[2,7],[2,8],[2,9],[2,10],[2,12],[3,7],[3,8],[3,9],[3,10],[3,12],[5,7],[5,8],[5,9],[5,10],[5,12],[6,7],[6,8],[6,9],[6,10],[6,12],[1,12],[4,12]],"build":[{"name":"Buttocks","parent":null,"mass":11.36,"radius":0.11,"half":0.06,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.0,0.0,0.0],"anchor":[-1.1920929e-07,-5.9890937e-10,5.2154064e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.5000003,-0.4999997,0.5000003,0.4999997],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-5.9897065e-10,0.04150086,1.0694689],"rot":[0.5000003,-0.4999997,0.5000003,0.4999997]}},{"name":"Thigh_Left","parent":0,"mass":8.0,"radius":0.075,"half":0.17309305,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-1.2293451e-07,0.094574064,4.4703484e-08],"anchor":[-8.96398e-09,0.23309308,-7.450581e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.86849123,0.05809995,-0.10490819,0.48097998],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.14162064,0.16517179,0.87757176],"rot":[0.86849123,0.05809995,-0.10490819,0.48097998]}},{"name":"Shin_Left","parent":1,"mass":3.72,"radius":0.055,"half":0.22129807,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-3.1432137e-09,-0.23309308,0.0],"anchor":[-2.3283064e-10,0.26529813,-7.450581e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.47296292,-0.0025139747,0.0013501621,0.88107777],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.18740514,0.14223689,0.4645681],"rot":[0.47296292,-0.0025139747,0.0013501621,0.88107777]}},{"name":"Foot_Left","parent":2,"mass":1.6,"radius":0.04,"half":0.0,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[2.3283064e-10,-0.2652981,1.4901161e-08],"anchor":[-1.0248868e-09,0.04500001,0.065000005],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.7071068,4.1083283e-07,4.1083283e-07,0.7071068],"boxed":[0.05,0.04,0.135],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.18614313,0.060630884,0.19846144],"rot":[0.7071068,4.1083283e-07,4.1083283e-07,0.7071068]}},{"name":"Thigh_Right","parent":0,"mass":8.0,"radius":0.075,"half":0.17309298,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-1.1362128e-07,-0.094574064,6.3329935e-08],"anchor":[4.307367e-09,0.23309296,-1.4901161e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.8684907,-0.05809916,0.10490885,0.48098084],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.14162049,0.16517161,0.8775716],"rot":[0.8684907,-0.05809916,0.10490885,0.48098084]}},{"name":"Shin_Right","parent":4,"mass":3.72,"radius":0.055,"half":0.22129807,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[5.2386895e-09,-0.23309302,5.2154064e-08],"anchor":[7.450581e-09,0.2652981,2.2351742e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.47296208,0.0025146583,-0.0013492071,0.8810782],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.18740511,0.1422359,0.46456796],"rot":[0.47296208,0.0025146583,-0.0013492071,0.8810782]}},{"name":"Foot_Right","parent":5,"mass":1.6,"radius":0.04,"half":0.0,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[7.3341653e-09,-0.26529807,-7.450581e-09],"anchor":[-1.0248868e-09,0.04500001,0.065000005],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":true,"reach":false,"bind":[0.7071068,4.1083283e-07,4.1083283e-07,0.7071068],"boxed":[0.05,0.04,0.135],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.18614323,0.060629513,0.19846158],"rot":[0.7071068,4.1083283e-07,4.1083283e-07,0.7071068]}},{"name":"Spine0","parent":0,"mass":7.2,"radius":0.1,"half":0.05,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.10877013,-3.7252903e-09,9.5493524e-05],"anchor":[-0.06653468,1.8626451e-09,0.05967301],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.47321805,-0.4732175,0.5254191,0.5254185],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-7.0224374e-08,0.10769005,1.2381896],"rot":[0.47321805,-0.4732175,0.5254191,0.5254185]}},{"name":"Spine1","parent":7,"mass":6.4,"radius":0.1,"half":0.06,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.05402352,-1.8626451e-09,0)DLRM",
++    R"DLRM(.059673008],"anchor":[-0.09850468,-1.1175871e-08,0.05767449],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.42552727,-0.4255268,0.5647363,0.5647357],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-9.8131295e-08,0.13657229,1.3769257],"rot":[0.42552727,-0.4255268,0.5647363,0.5647357]}},{"name":"Spine2","parent":8,"mass":5.6,"radius":0.105,"half":0.065,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.06541972,-3.7252903e-09,0.057674482],"anchor":[-0.051796082,0.0,0.05821169],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.43522248,-0.43522197,0.5572989,0.55729824],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-1.3030565e-07,0.16819808,1.4918572],"rot":[0.43522248,-0.43522197,0.5572989,0.55729824]}},{"name":"Spine3","parent":9,"mass":5.92,"radius":0.1,"half":0.08,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.022716895,-1.8626451e-09,0.05821169],"anchor":[-0.04937281,0.0,0.04850974],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.43522248,-0.43522197,0.55729884,0.5572982],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-1.3676356e-07,0.17625456,1.5641493],"rot":[0.43522248,-0.43522197,0.55729884,0.5572982]}},{"name":"Neck","parent":10,"mass":0.96,"radius":0.06,"half":0.035465244,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.025140159,-1.8626451e-09,0.048509747],"anchor":[1.3322676e-14,-0.035465308,-2.142042e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.61534774,3.7334908e-07,4.456242e-07,0.7882558],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-9.6321955e-08,0.14389,1.6347003],"rot":[0.61534774,3.7334908e-07,4.456242e-07,0.7882558]}},{"name":"Head","parent":11,"mass":5.52,"radius":0.085,"half":0.03,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[1.687539e-14,0.035465192,-2.2351742e-08],"anchor":[0.0,-0.09000005,0.030000005],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.7071068,4.1083283e-07,4.1083283e-07,0.7071068],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-1.398022e-07,0.18249722,1.7591052],"rot":[0.7071068,4.1083283e-07,4.1083283e-07,0.7071068]}},{"name":"Clavicle_Left","parent":10,"mass":1.2,"radius":0.04,"half":0.036303442,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.025142696,0.03310412,0.049284704],"anchor":[4.656613e-09,0.06830345,3.7252903e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.36235937,0.6072032,0.5666717,-0.42294586],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.09590202,0.1280319,1.5744174],"rot":[0.36235937,0.6072032,0.5666717,-0.42294586]}},{"name":"Upper_Arm_Left","parent":13,"mass":2.24,"radius":0.048,"half":0.09028339,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-4.656613e-09,-0.06830345,-3.7252903e-09],"anchor":[1.1175871e-08,0.12868333,-2.0489097e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":true,"bind":[0.60000414,0.16060008,-0.1245361,0.77375287],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.20829976,0.089493774,1.4340129],"rot":[0.60000414,0.16060008,-0.1245361,0.77375287]}},{"name":"Lower_Arm_Left","parent":14,"mass":1.28,"radius":0.04,"half":0.08898516,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[2.6077032e-08,-0.12868345,-1.3038516e-08],"anchor":[-3.4924597e-10,0.12098516,-7.450581e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":true,"bind":[0.8249473,0.027299752,-0.039991148,0.5631317],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.26879832,0.10152711,1.2075324],"rot":[0.8249473,0.027299752,-0.039991148,0.5631317]}},{"name":"Hand_Left","parent":15,"mass":0.48,"radius":0.03,"half":0.0,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[2.3283064e-10,-0.12098516,0.0],"anchor":[8.265488e-09,0.07999996,1.8626451e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.8249474,0.027299767,-0.03999117,0.5631317],"boxed":[0.03,0.08,0.045],"inertia":[0.0,0.0,0.0],"frame":{"pos":[-0.28690353,0.17474096,1.0212344],"rot":[0.8249474,0.027299767,-0.03999117,0.5631317]}},{"name":"Clavicle_Right","parent":10,"mass":1.2,"radius":0.04,"half":0.03630345,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[0.02514268,-0.03310413,0.049284782],"anchor":[-7.450581e-09,0.06830346,7.450581e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.56667215,-0.42294523,0.36236,0.6072028],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.09590186,0.12803203,1.5744174],"rot":[0.56667215,-0.42294523,0.36236,0.6072028]}},{"name":"Upper_Arm_Right","parent":17,"mass":2.24,"radius":0.048,"half":0.09028339,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[7.450581e-09,-0.06830346,-7.450581e-09],"anchor":[-1.8626451e-08,0.12868336,-3.3527613e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":true,"bind":[0.4463652,-0.16732666,0.085367754,0.87491274],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.19714466,0.046003018,1.4515159],"rot":[0.4463652,-0.16732666,0.085367754,0.87491274]}},{"name":"Lower_Arm_Right","parent":18,"mass":1.28,"radius":0.04,"half":0.088985175,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-1.8626451e-08,-0.12868343,-4.0978193e-08],"anchor":[1.8626451e-09,0.12098518,-3.7252903e-09],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":true,"bind":[0.8126527,-0.034536485,0.0484155,0.57970583],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.24917212,0.009853768,1.2410951],"rot":[0.8126527,-0.034536485,0.0484155,0.57970583]}},{"name":"Hand_Right","parent":19,"mass":0.48,"radius":0.03,"half":0.0,"offset":{"pos":[0.0,0.0,0.0],"rot":[0.0,0.0,0.0,1.0]},"rest":[0.0,0.0,0.0,1.0],"anchor_parent":[-1.8626451e-09,-0.12098518,3.7252903e-09],"anchor":[1.5483238e-08,0.08000003,-1.1175871e-08],"limit":{"cone":{"swing":1.0,"twist":0.5}},"lower":false,"reach":false,"bind":[0.8126527,-0.034536496,0.04841552,0.5797058],"boxed":[0.03,0.08,0.045],"inertia":[0.0,0.0,0.0],"frame":{"pos":[0.27173588,0.07527381,1.0523992],"rot":[0.8126527,-0.034536496,0.04841552,0.5797058]}}]})DLRM",
++};
+diff --git a/apps/openmw/mwmechanics/deliriumbody.cpp b/apps/openmw/mwmechanics/deliriumbody.cpp
+new file mode 100644
+index 000000000..b026e3cc5
+--- /dev/null
++++ b/apps/openmw/mwmechanics/deliriumbody.cpp
+@@ -0,0 +1,745 @@
++#include "deliriumbody.hpp"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++
++#include <components/debug/debuglog.hpp>
++#include <components/misc/rng.hpp>
++
++#ifdef FISICA_DELIRIUM
++#define DELIRIUM_PHYSICS_STATIC
++#include <delirium_physics.h>
++#endif
++
++namespace MWMechanics
++{
++    namespace
++    {
++        std::string sError;
++    }
++
++    const std::string& DeliriumBody::lastError()
++    {
++        return sError;
++    }
++
++#ifndef FISICA_DELIRIUM
++    bool DeliriumBody::available()
++    {
++        return false;
++    }
++    std::unique_ptr<DeliriumBody> DeliriumBody::create(
++        const BoneGetter&, const osg::Matrixf&, const osg::Vec3f&, float, bool, bool)
++    {
++        return nullptr;
++    }
++    DeliriumBody::~DeliriumBody() = default;
++    void DeliriumBody::setWorld(const std::vector<osg::Vec3f>&) {}
++    void DeliriumBody::step(float) {}
++    DeliriumBody::Poses DeliriumBody::getBonePoses() const
++    {
++        sRig = mBeast ? kRigBeast : kRig;
++        return {};
++    }
++    osg::Vec3f DeliriumBody::getPelvisPosition() const
++    {
++        return {};
++    }
++    osg::Vec3f DeliriumBody::getFacing() const
++    {
++        return {};
++    }
++    float DeliriumBody::getHeadHeight() const
++    {
++        return 0;
++    }
++    std::string DeliriumBody::hit(const Blow&)
++    {
++        return {};
++    }
++    void DeliriumBody::die(const osg::Vec3f&) {}
++    void DeliriumBody::relax() {}
++#else
++
++    struct DeliriumMath
++    {
++        using V3 = DeliriumBody::V3;
++        using Q = DeliriumBody::Q;
++        static V3 add(const V3& a, const V3& b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
++        static V3 sub(const V3& a, const V3& b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
++        static V3 scl(const V3& a, float s) { return { a.x * s, a.y * s, a.z * s }; }
++        static Q conj(const Q& q) { return { -q.x, -q.y, -q.z, q.w }; }
++        // Hamilton product: the turn b, then a
++        static Q mul(const Q& a, const Q& b)
++        {
++            return { a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
++                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
++        }
++        static V3 rot(const Q& q, const V3& v)
++        {
++            const V3 u{ q.x, q.y, q.z };
++            const V3 t{ 2 * (u.y * v.z - u.z * v.y), 2 * (u.z * v.x - u.x * v.z), 2 * (u.x * v.y - u.y * v.x) };
++            return { v.x + q.w * t.x + (u.y * t.z - u.z * t.y), v.y + q.w * t.y + (u.z * t.x - u.x * t.z),
++                v.z + q.w * t.z + (u.x * t.y - u.y * t.x) };
++        }
++        static Q norm(const Q& q)
++        {
++            const float n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
++            return n > 1e-6f ? Q{ q.x / n, q.y / n, q.z / n, q.w / n } : Q{};
++        }
++        static float len(const V3& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
++    };
++
++    namespace
++    {
++        using V3 = DeliriumMath::V3;
++        using Q = DeliriumMath::Q;
++        using M = DeliriumMath;
++
++        constexpr float sUnit = 0.0142875f; // metres per game unit
++        constexpr int sParent[21] = { -1, 0, 1, 2, 0, 4, 5, 0, 7, 8, 9, 10, 11, 10, 13, 14, 15, 10, 17, 18, 19 };
++        constexpr int sChest = 10;
++        constexpr int sHead = 12;
++        constexpr float sStep = 1.f / 60.f;
++
++        struct RigPart
++        {
++            const char* mName;
++            const char* mBone; // its turn is this bone's, through mOffset
++            const char* mJointA; // the midpoint of these two bones is its joint
++            const char* mJointB;
++            bool mWrite;
++            float mOffset[4]; // bone rotation = part rotation * offset
++            float mAnchor[3]; // the part's joint in its own frame
++            float mInParent[3]; // the same joint in its parent's frame
++        };
++
++#include "delirium_mw.inc"
++
++        // The bones Delirium writes, parents first as Morrowind's skeleton has them (the thighs hang off the
++        // spine's first bone), with the part each takes its turn from and its parent's index here.
++        struct WrittenBone
++        {
++            const char* mName;
++            int mPart;
++            int mParent;
++        };
++        constexpr WrittenBone sWritten[] = {
++            { "Bip01 Pelvis", 0, -1 },
++            { "Bip01 Spine", 7, 0 },
++            { "Bip01 L Thigh", 1, 1 },
++            { "Bip01 L Calf", 2, 2 },
++            { "Bip01 L Foot", 3, 3 },
++            { "Bip01 R Thigh", 4, 1 },
++            { "Bip01 R Calf", 5, 5 },
++            { "Bip01 R Foot", 6, 6 },
++            { "Bip01 Spine1", 8, 1 },
++            { "Bip01 Spine2", 10, 8 },
++            { "Bip01 Neck", 11, 9 },
++            { "Bip01 Head", 12, 10 },
++            { "Bip01 L Clavicle", 13, 10 },
++            { "Bip01 L UpperArm", 14, 12 },
++            { "Bip01 L Forearm", 15, 13 },
++            { "Bip01 L Hand", 16, 14 },
++            { "Bip01 R Clavicle", 17, 10 },
++            { "Bip01 R UpperArm", 18, 16 },
++            { "Bip01 R Forearm", 19, 17 },
++            { "Bip01 R Hand", 20, 18 },
++        };
++
++        NmBuild* sBuild = nullptr;
++        NmBuild* sBuildBeast = nullptr;
++        const RigPart* sRig = kRig; // the one in use (set by whoever is working: one thread)
++
++        std::string joined(const char* const* pieces, size_t count)
++        {
++            std::string text;
++            for (size_t i = 0; i < count; ++i)
++                text += pieces[i];
++            return text;
++        }
++        int sState = 0; // 0: not tried, 1: ready, -1: failed
++
++        std::string engineError()
++        {
++            char buffer[512] = {};
++            nm_last_error(buffer, sizeof(buffer));
++            return buffer;
++        }
++
++        bool init()
++        {
++            if (sState != 0)
++                return sState > 0;
++            sState = -1;
++            const std::string person = joined(kCharacter, std::size(kCharacter));
++            const std::string beast = joined(kCharacterBeast, std::size(kCharacterBeast));
++            if (nm_init_character(person.c_str()) < 0)
++            {
++                sError = "character: " + engineError();
++                Log(Debug::Error) << "Delirium: " << sError;
++                return false;
++            }
++            sBuild = nm_build_from_character(person.c_str());
++            sBuildBeast = nm_build_from_character(beast.c_str());
++            if (sBuild == nullptr || sBuildBeast == nullptr)
++            {
++                sError = "body: " + engineError();
++                Log(Debug::Error) << "Delirium: " << sError;
++                return false;
++            }
++            Log(Debug::Info) << "Delirium: engine ready (its own character, made for Morrowind's skeleton)";
++            sState = 1;
++            return true;
++        }
++
++        Q offsetOf(int part)
++        {
++            const float* o = sRig[part].mOffset;
++            return { o[0], o[1], o[2], o[3] };
++        }
++        V3 anchorOf(int part)
++        {
++            const float* a = sRig[part].mAnchor;
++            return { a[0], a[1], a[2] };
++        }
++        V3 inParentOf(int part)
++        {
++            const float* a = sRig[part].mInParent;
++            return { a[0], a[1], a[2] };
++        }
++
++        Q rotationOf(const osg::Matrixf& rigid)
++        {
++            const osg::Quat q = rigid.getRotate();
++            return M::norm({ static_cast<float>(q.x()), static_cast<float>(q.y()), static_cast<float>(q.z()),
++                static_cast<float>(q.w()) });
++        }
++
++        float random(float low, float high)
++        {
++            return low + (high - low) * Misc::Rng::rollClosedProbability();
++        }
++
++        bool finite(const float* values, int count)
++        {
++            for (int i = 0; i < count; ++i)
++                if (!std::isfinite(values[i]))
++                    return false;
++            return true;
++        }
++    }
++
++    bool DeliriumBody::available()
++    {
++        return init();
++    }
++
++    DeliriumBody::V3 DeliriumBody::toPhysics(const osg::Vec3f& world) const
++    {
++        const osg::Vec3f rigid = world * mSizeInverse - mOrigin;
++        return { rigid.x() * sUnit, rigid.y() * sUnit, rigid.z() * sUnit };
++    }
++
++    osg::Vec3f DeliriumBody::toWorld(const V3& physics) const
++    {
++        return (osg::Vec3f(physics.x, physics.y, physics.z) / sUnit + mOrigin) * mSize;
++    }
++
++    void DeliriumBody::partsFromBones(const BoneGetter& bone, std::array<V3, 21>& pos, std::array<Q, 21>& rot) const
++    {
++        // Parts from the bones as the animation posed them: turns through the rig, places down the chain from the
++        // pelvis (as Skyrim Delirium's PartsFromBones).
++        for (int i = 0; i < 21; ++i)
++        {
++            const osg::Matrixf rigid = *bone(sRig[i].mBone) * mSizeInverse;
++            rot[i] = M::norm(M::mul(rotationOf(rigid), M::conj(offsetOf(i))));
++            if (i == 0)
++            {
++                const osg::Vec3f at = rigid.getTrans() - mOrigin;
++                pos[0] = M::sub({ at.x() * sUnit, at.y() * sUnit, at.z() * sUnit }, M::rot(rot[0], anchorOf(0)));
++            }
++            else
++            {
++                const int p = sParent[i];
++                pos[i] = M::sub(M::add(pos[p], M::rot(rot[p], inParentOf(i))), M::rot(rot[i], anchorOf(i)));
++            }
++        }
++    }
++
++    std::unique_ptr<DeliriumBody> DeliriumBody::create(
++        const BoneGetter& bone, const osg::Matrixf& base, const osg::Vec3f& position, float heading, bool beast,
++        bool dying)
++    {
++        if (!init())
++            return nullptr;
++        sRig = beast ? kRigBeast : kRig;
++        for (int i = 0; i < 21; ++i)
++            if (!bone(sRig[i].mBone) || !bone(sRig[i].mJointA) || !bone(sRig[i].mJointB))
++                return nullptr;
++
++        std::unique_ptr<DeliriumBody> body(new DeliriumBody);
++        body->mBeast = beast;
++        body->mOrigin = position;
++        // The actor is drawn at its race's size (not the same along every axis); the body is Delirium's own, at a
++        // person's. From one to the other: the actor's size, about where it stands, along its own axes.
++        {
++            osg::Vec3f translation, scale;
++            osg::Quat rotation, scaleOrientation;
++            base.decompose(translation, rotation, scale, scaleOrientation);
++            osg::Matrixf placed;
++            placed.makeRotate(rotation);
++            placed.setTrans(translation);
++            body->mSize = osg::Matrixf::inverse(placed) * base;
++            body->mSizeInverse = osg::Matrixf::inverse(body->mSize);
++        }
++
++        const float zero[3] = {};
++        const float yaw = std::atan2(std::cos(heading), std::sin(heading)) - (beast ? kRigYawBeast : kRigYaw);
++        body->mAgent = nm_agent_create(beast ? sBuildBeast : sBuild, zero, yaw, Misc::Rng::rollClosedProbability());
++        body->mWorld = nm_world_create();
++        if (body->mAgent == nullptr || body->mWorld == nullptr)
++        {
++            sError = "agent: " + engineError();
++            return nullptr;
++        }
++        nm_world_add_floor(body->mWorld, 0, 0, 0, 100.f);
++
++        // The body's own standing stance, each part in its parent's frame: the legs hold it while it stands.
++        {
++            std::array<V3, 21> rp;
++            std::array<Q, 21> rq;
++            for (int i = 0; i < 21; ++i)
++            {
++                float p[3] = {}, q[4] = { 0, 0, 0, 1 };
++                nm_agent_get_part_transform(body->mAgent, i, p, q);
++                rp[i] = { p[0], p[1], p[2] };
++                rq[i] = { q[0], q[1], q[2], q[3] };
++            }
++            for (int i = 1; i < 21; ++i)
++            {
++                const int p = sParent[i];
++                body->mRestRot[i] = M::mul(M::conj(rq[p]), rq[i]);
++                body->mRestPos[i] = M::rot(M::conj(rq[p]), M::sub(rp[i], rp[p]));
++            }
++        }
++
++        std::array<V3, 21> pos;
++        std::array<Q, 21> rot;
++        body->partsFromBones(bone, pos, rot);
++        nm_agent_set_mode(body->mAgent, NM_MODE_LEAD);
++        for (int i = 0; i < 21; ++i)
++        {
++            const float p[3] = { pos[i].x, pos[i].y, pos[i].z };
++            const float q[4] = { rot[i].x, rot[i].y, rot[i].z, rot[i].w };
++            if (!finite(p, 3) || !finite(q, 4))
++            {
++                sError = "the pose is not a number";
++                return nullptr;
++            }
++            nm_agent_set_part_state(body->mAgent, i, p, q, zero, zero);
++        }
++
++        // The posture the muscles and the balance hold: the pose it was in, but with the legs of the body's own
++        // stance, soles level (a lunging attack's legs held still would tip it over by themselves).
++        {
++            std::array<V3, 21> zp = pos;
++            std::array<Q, 21> zr = rot;
++            if (!dying)
++            {
++                for (int i = 1; i <= 6; ++i)
++                {
++                    const int p = sParent[i];
++                    zr[i] = M::mul(zr[p], body->mRestRot[i]);
++                    zp[i] = M::add(zp[p], M::rot(zr[p], body->mRestPos[i]));
++                }
++                for (int i : { 3, 6 })
++                {
++                    const V3 u = M::rot(zr[i], { 0, 1, 0 });
++                    const Q t{ u.y, -u.x, 0.f, 1.f + u.z };
++                    const float n = std::sqrt(t.x * t.x + t.y * t.y + t.z * t.z + t.w * t.w);
++                    if (n > 1e-4f)
++                        zr[i] = M::mul({ t.x / n, t.y / n, t.z / n, t.w / n }, zr[i]);
++                }
++            }
++            float transforms[21 * 7];
++            for (int i = 0; i < 21; ++i)
++            {
++                const float v[7] = { zp[i].x, zp[i].y, zp[i].z, zr[i].x, zr[i].y, zr[i].z, zr[i].w };
++                std::copy_n(v, 7, transforms + i * 7);
++            }
++            nm_agent_set_zero_pose(body->mAgent, transforms, 21);
++        }
++
++        // The bones it writes: where each sits in its parent bone, as the skeleton has them now (their lengths stay).
++        for (const WrittenBone& written : sWritten)
++        {
++            Bone entry{ written.mName, written.mPart, written.mParent, {} };
++            if (written.mParent >= 0)
++            {
++                const osg::Matrixf own = *bone(written.mName) * body->mSizeInverse;
++                const osg::Matrixf parent = *bone(sWritten[written.mParent].mName) * body->mSizeInverse;
++                const osg::Vec3f offset = own.getTrans() - parent.getTrans();
++                entry.mInParent
++                    = M::rot(M::conj(rotationOf(parent)), { offset.x() * sUnit, offset.y() * sUnit, offset.z() * sUnit });
++            }
++            body->mBones.push_back(std::move(entry));
++        }
++
++        if (!dying)
++            body->message("bodyBalance");
++        return body;
++    }
++
++    DeliriumBody::~DeliriumBody()
++    {
++        if (mAgent != nullptr)
++            nm_agent_destroy(mAgent);
++        if (mWorld != nullptr)
++            nm_world_destroy(mWorld);
++    }
++
++    void DeliriumBody::setWorld(const std::vector<osg::Vec3f>& triangles)
++    {
++        const bool bothWays = std::getenv("FISICA_BOTH") != nullptr;
++        if (triangles.size() < 3)
++            return;
++        NmWorld* world = nm_world_create();
++        if (world == nullptr)
++            return;
++        std::vector<float> positions;
++        std::vector<uint32_t> indices;
++        positions.reserve(triangles.size() * 3);
++        indices.reserve(triangles.size());
++        for (const osg::Vec3f& vertex : triangles)
++        {
++            const V3 p = toPhysics(vertex);
++            indices.push_back(static_cast<uint32_t>(positions.size() / 3));
++            positions.insert(positions.end(), { p.x, p.y, p.z });
++        }
++        // Morrowind's collision meshes face any way; Delirium's world wants them facing out: both ways.
++        if (bothWays)
++        {
++            const size_t count = indices.size();
++            for (size_t i = 0; i + 2 < count; i += 3)
++                indices.insert(indices.end(), { indices[i], indices[i + 2], indices[i + 1] });
++        }
++        if (nm_world_add_mesh(world, positions.data(), static_cast<int32_t>(positions.size() / 3), indices.data(),
++                static_cast<int32_t>(indices.size() / 3), nullptr)
++            < 0)
++        {
++            sError = "world: " + engineError();
++            nm_world_destroy(world);
++            return;
++        }
++        // No ground under it there (a hole in what was gathered): the flat floor stays as well.
++        const V3 pelvis = toPhysics(getPelvisPosition());
++        const float from[3] = { pelvis.x, pelvis.y, pelvis.z }, down[3] = { 0, 0, -1 };
++        float distance = 0, normal[3] = {};
++        const int found = nm_world_raycast(world, from, down, 3.f, &distance, normal);
++        Log(Debug::Verbose) << "Delirium: ground " << distance << " m under the pelvis (" << pelvis.z
++                            << " m over its feet), facing " << normal[2] << (found > 0 ? "" : " (none)");
++        if (found <= 0)
++            nm_world_add_floor(world, 0, 0, 0, 100.f);
++        nm_world_destroy(mWorld);
++        mWorld = world;
++    }
++
++    void DeliriumBody::message(const char* name, bool start)
++    {
++        nm_msg_begin(mAgent, name);
++        if (start)
++            nm_msg_set_bool(mAgent, "start", 1);
++        nm_msg_send(mAgent, mWorld);
++    }
++
++    void DeliriumBody::step(float duration)
++    {
++        const float dt = std::clamp(duration, 0.f, 0.1f);
++        if (dt <= 0 || mBroken)
++            return;
++        mAge += dt;
++        mSincePush += dt;
++        const int steps = std::clamp(static_cast<int>(std::ceil(dt / sStep - 0.05f)), 1, 6);
++        for (int n = 0; n < steps; ++n)
++            if (nm_agent_step(mAgent, mWorld, dt / steps) < 0)
++            {
++                sError = "step: " + engineError();
++                mBroken = true;
++                return;
++            }
++        float head[3] = {}, q[4] = {};
++        nm_agent_get_part_transform(mAgent, sHead, head, q);
++        float pelvis[3] = {};
++        nm_agent_get_part_transform(mAgent, 0, pelvis, q);
++        if (pelvis[2] < -8.f)
++        {
++            sError = "fell out of its world";
++            mBroken = true;
++            return;
++        }
++        if (!finite(head, 3) || !finite(pelvis, 3) || !finite(q, 4))
++        {
++            sError = "not a number";
++            mBroken = true;
++            return;
++        }
++
++        const bool fallen = nm_agent_has_fallen(mAgent) != 0;
++        const bool balancing = nm_agent_is_balancing(mAgent) != 0;
++        const float energy = nm_agent_get_kinetic_energy(mAgent);
++        mOffBalance = mWasBalancing && !balancing ? mOffBalance + dt : 0.f;
++        mWasBalancing = mWasBalancing || balancing;
++        // Down: Delirium says so (or its balance is gone) and the head is on its way to the ground.
++        if (!mDown && (fallen || mOffBalance > 0.25f || mDying) && head[2] - pelvis[2] < 0.35f && head[2] < 1.0f)
++        {
++            mDown = true;
++            mDownAt = mAge;
++            if (!mDying && mWritheFor > 0)
++                mWritheUntil = -2; // starts once it has broken the fall
++        }
++        if (mDown && !mDying && !mLimp)
++        {
++            if (mWritheUntil == -2 && mAge - mDownAt > 0.7f)
++            {
++                // Hurt, on the ground: it writhes a while.
++                message("stopAllBehaviours", false);
++                const float stiffness = random(9.f, 12.f), period = random(2.f, 4.f), amplitude = random(0.7f, 1.3f);
++                nm_msg_begin(mAgent, "bodyWrithe");
++                nm_msg_set_bool(mAgent, "start", 1);
++                for (const char* n : { "armStiffness", "legStiffness", "backStiffness" })
++                    nm_msg_set_float(mAgent, n, stiffness);
++                for (const char* n : { "armPeriod", "legPeriod", "backPeriod" })
++                    nm_msg_set_float(mAgent, n, period * random(0.8f, 1.2f));
++                for (const char* n : { "armAmplitude", "legAmplitude", "backAmplitude", "kneeAmplitude", "elbowAmplitude" })
++                    nm_msg_set_float(mAgent, n, amplitude * random(0.8f, 1.2f));
++                for (const char* n : { "armDamping", "legDamping", "backDamping" })
++                    nm_msg_set_float(mAgent, n, 1.f);
++                nm_msg_send(mAgent, mWorld);
++                mWritheUntil = mAge + mWritheFor;
++            }
++            else if (mWritheUntil >= 0 && mAge >= mWritheUntil)
++            {
++                mWritheUntil = -1;
++                message("stopAllBehaviours", false);
++                nm_msg_begin(mAgent, "bodyRelax");
++                nm_msg_set_bool(mAgent, "start", 1);
++                nm_msg_set_float(mAgent, "relaxation", 60.f);
++                nm_msg_set_float(mAgent, "damping", 1.f);
++                nm_msg_send(mAgent, mWorld);
++            }
++        }
++        if (mDying && !mLimp && mRelaxAt >= 0 && mAge >= mRelaxAt)
++        {
++            mLimp = true;
++            message("stopAllBehaviours", false);
++            nm_msg_begin(mAgent, "bodyRelax");
++            nm_msg_set_bool(mAgent, "start", 1);
++            nm_msg_set_float(mAgent, "relaxation", random(60.f, 100.f));
++            nm_msg_set_float(mAgent, "damping", 1.f);
++            nm_msg_send(mAgent, mWorld);
++        }
++        const bool writhing = mWritheUntil >= 0 || mWritheUntil == -2;
++        mCalm = (!mDown && balancing && !fallen && energy < 2.f && mSincePush > 0.6f) ? mCalm + dt : 0.f;
++        mStill = (mDown && energy < 1.5f && !writhing) ? mStill + dt : 0.f;
++    }
++
++    DeliriumBody::Poses DeliriumBody::getBonePoses() const
++    {
++        sRig = mBeast ? kRigBeast : kRig;
++        Poses poses;
++        poses.reserve(mBones.size());
++        std::vector<V3> places(mBones.size());
++        std::vector<Q> turns(mBones.size());
++        for (size_t i = 0; i < mBones.size(); ++i)
++        {
++            const Bone& bone = mBones[i];
++            float p[3] = {}, q[4] = { 0, 0, 0, 1 };
++            nm_agent_get_part_transform(mAgent, bone.mPart, p, q);
++            const Q part{ q[0], q[1], q[2], q[3] };
++            turns[i] = M::norm(M::mul(part, offsetOf(bone.mPart)));
++            if (bone.mParent < 0)
++                places[i] = M::add({ p[0], p[1], p[2] }, M::rot(part, anchorOf(bone.mPart)));
++            else
++                places[i] = M::add(places[bone.mParent], M::rot(turns[bone.mParent], bone.mInParent));
++            osg::Matrixf rigid;
++            rigid.makeRotate(osg::Quat(turns[i].x, turns[i].y, turns[i].z, turns[i].w));
++            rigid.setTrans(osg::Vec3f(places[i].x, places[i].y, places[i].z) / sUnit + mOrigin);
++            poses.emplace_back(bone.mName, rigid * mSize);
++        }
++        return poses;
++    }
++
++    osg::Vec3f DeliriumBody::getPelvisPosition() const
++    {
++        float p[3] = {}, q[4] = { 0, 0, 0, 1 };
++        nm_agent_get_part_transform(mAgent, 0, p, q);
++        return toWorld({ p[0], p[1], p[2] });
++    }
++
++    osg::Vec3f DeliriumBody::getFacing() const
++    {
++        float l[3] = {}, r[3] = {}, q[4] = {};
++        nm_agent_get_part_transform(mAgent, 1, l, q);
++        nm_agent_get_part_transform(mAgent, 4, r, q);
++        // left x up
++        osg::Vec3f facing(l[1] - r[1], -(l[0] - r[0]), 0.f);
++        if (facing.normalize() <= 0)
++            return osg::Vec3f(0, 1, 0);
++        return facing;
++    }
++
++    float DeliriumBody::getHeadHeight() const
++    {
++        float p[3] = {}, q[4] = {};
++        nm_agent_get_part_transform(mAgent, sHead, p, q);
++        return p[2] / sUnit;
++    }
++
++    void DeliriumBody::push(const V3& at, const V3& direction, float impulse)
++    {
++        if (impulse <= 0)
++            return;
++        const float p[3] = { at.x, at.y, at.z };
++        const float i[3] = { direction.x * impulse, direction.y * impulse, direction.z * impulse };
++        nm_agent_apply_push(mAgent, p, i);
++        mSincePush = 0;
++        mCalm = 0;
++        mStill = 0;
++    }
++
++    std::string DeliriumBody::hit(const Blow& blow)
++    {
++        // As Skyrim Delirium's reaction table for a weapon's blow: a light one flinches (guard up, turned to whoever
++        // did it), a harder one is GTA's shot reaction (wounded where it landed, fighting to stay on its feet,
++        // steps to catch itself), and past what the steps can catch it falls. On the ground it only takes the push.
++        constexpr float flinchBelow = 55.f, maxPush = 160.f, plainPush = 45.f;
++        float at[3] = {}, q[4] = {};
++        int part = sChest;
++        if (blow.mPoint)
++        {
++            const V3 p = toPhysics(*blow.mPoint);
++            at[0] = p.x, at[1] = p.y, at[2] = p.z;
++            part = std::max(0, nm_agent_nearest_part(mAgent, at));
++        }
++        // (The point Morrowind gives is on the actor's box, not its body: the part's own middle, at that height.)
++        {
++            float pp[3] = {};
++            nm_agent_get_part_transform(mAgent, part, pp, q);
++            at[0] = pp[0], at[1] = pp[1], at[2] = pp[2];
++        }
++        const V3 direction{ blow.mDirection.x(), blow.mDirection.y(), blow.mDirection.z() };
++        const bool pushes = M::len(direction) > 0.5f;
++        const float want = std::min(blow.mPush, maxPush);
++        if (mDown || mDying)
++        {
++            if (pushes)
++                push({ at[0], at[1], at[2] }, direction, want * 0.6f);
++            return "en el suelo: solo el empujon";
++        }
++        float look[3] = {};
++        const bool sees = blow.mFrom.has_value();
++        if (sees)
++        {
++            const V3 from = toPhysics(*blow.mFrom);
++            look[0] = from.x, look[1] = from.y, look[2] = from.z;
++        }
++        const float oomph = std::clamp((blow.mPush / plainPush - 1.3f) / (4.f - 1.3f), 0.f, 1.f);
++        std::string how;
++        int result = 0;
++        if (!blow.mFall && blow.mPush < flinchBelow)
++        {
++            if (sees)
++            {
++                result = nm_agent_task_flinch(mAgent, mWorld, nullptr, look);
++                how = "se encoge (flinch)";
++            }
++            else
++            {
++                result = nm_agent_task_balance(mAgent, mWorld, nullptr, nullptr);
++                how = "da un paso";
++            }
++        }
++        else
++        {
++            // GTA's health scale: 100 and up stays on its feet and catches a fall, under 100 is hurt and falls.
++            const float share = std::clamp(blow.mHealth, 0.f, 1.f);
++            float health = share >= 0.2f ? 100.f + 100.f * share : 50.f + 49.f * share / 0.2f;
++            if (blow.mFall)
++                health = std::min(health, 60.f);
++            const float d[3] = { direction.x, direction.y, direction.z };
++            result = nm_agent_task_shot(mAgent, mWorld, "MELEE", part, at, d, health);
++            how = blow.mFall ? "herido, cae (shot)" : "herido, aguanta de pie (shot)";
++            if (result >= 0 && oomph > 0)
++            {
++                // A harder hit jolts harder: the shot twists the spine on impact.
++                const float k = 1.f + 2.f * oomph;
++                nm_msg_begin(mAgent, "shot");
++                nm_msg_set_bool(mAgent, "alwaysAddShockSpin", 1);
++                nm_msg_set_float(mAgent, "shockSpinMin", 40.f * k);
++                nm_msg_set_float(mAgent, "shockSpinMax", 80.f * k);
++                nm_msg_send(mAgent, mWorld);
++                if (pushes)
++                {
++                    // ...and the head snaps with it.
++                    float hp[3] = {};
++                    nm_agent_get_part_transform(mAgent, sHead, hp, q);
++                    push({ hp[0], hp[1], hp[2] }, direction, 0.2f * want * (0.5f + oomph));
++                }
++            }
++            mWritheFor = std::max(mWritheFor, 0.5f * (1.f + 1.2f * oomph));
++        }
++        if (result < 0)
++            how += " [error: " + engineError() + "]";
++        if (pushes)
++            push({ at[0], at[1], at[2] }, direction, want);
++        mSincePush = 0;
++        mCalm = 0;
++        return how + ", empujon " + std::to_string(static_cast<int>(want)) + " N s";
++    }
++
++    void DeliriumBody::die(const osg::Vec3f& away)
++    {
++        if (mDying)
++            return;
++        mDying = true;
++        mWritheUntil = -1;
++        // The killing blow as a shot at little health: Delirium's own hit reaction (stagger, clutch, collapse), on
++        // the upper body, away from the killer (up to 25 degrees either way, so every body doesn't fall the same).
++        message("stopAllBehaviours", false);
++        constexpr int parts[] = { 8, 9, 10, 11, 13, 17 };
++        const int part = parts[Misc::Rng::rollDice(6)];
++        float at[3] = {}, q[4] = {};
++        nm_agent_get_part_transform(mAgent, part, at, q);
++        V3 direction{ away.x(), away.y(), 0.f };
++        if (M::len(direction) > 0.5f)
++        {
++            const float t = random(-0.44f, 0.44f), cs = std::cos(t), sn = std::sin(t);
++            direction = { direction.x * cs - direction.y * sn, direction.x * sn + direction.y * cs, 0.f };
++            direction = M::scl(direction, 1.f / M::len(direction));
++        }
++        else
++            direction = {};
++        const float d[3] = { direction.x, direction.y, direction.z };
++        nm_agent_task_shot(mAgent, mWorld, nullptr, part, at, d, 70.f);
++        if (M::len(direction) > 0.5f)
++            push({ at[0], at[1], at[2] }, direction, 0.5f * nm_agent_get_mass(mAgent) * 1.5f * random(0.8f, 1.2f));
++        mRelaxAt = mAge + random(1.8f, 3.f);
++    }
++
++    void DeliriumBody::relax()
++    {
++        if (mLimp)
++            return;
++        mLimp = true;
++        mWritheUntil = -1;
++        message("stopAllBehaviours", false);
++        nm_msg_begin(mAgent, "bodyRelax");
++        nm_msg_set_bool(mAgent, "start", 1);
++        nm_msg_set_float(mAgent, "relaxation", 80.f);
++        nm_msg_set_float(mAgent, "damping", 1.f);
++        nm_msg_send(mAgent, mWorld);
++    }
++#endif
++}
+diff --git a/apps/openmw/mwmechanics/deliriumbody.hpp b/apps/openmw/mwmechanics/deliriumbody.hpp
+new file mode 100644
+index 000000000..56423f29c
+--- /dev/null
++++ b/apps/openmw/mwmechanics/deliriumbody.hpp
+@@ -0,0 +1,141 @@
++#ifndef OPENMW_MWMECHANICS_DELIRIUMBODY_H
++#define OPENMW_MWMECHANICS_DELIRIUMBODY_H
++
++#include <array>
++#include <functional>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include <osg/Matrixf>
++#include <osg/Vec3f>
++
++struct NmAgent;
++struct NmWorld;
++
++namespace MWMechanics
++{
++    // Fisica: the real Delirium engine (PVCPC/delirium-physics, GPL-3: the behaviours of GTA IV's Euphoria,
++    // rewritten) driving one actor's body, as Skyrim Delirium does it: the body is Delirium's own (21 parts with
++    // muscles, in a little world of its own: the ground and what is around), started from the pose the animation
++    // left, and the bones are put where its parts are. It balances, takes a step to catch a blow, flinches, falls,
++    // breaks the fall, writhes, dies.
++    class DeliriumBody
++    {
++    public:
++        using Poses = std::vector<std::pair<std::string, osg::Matrixf>>;
++        using BoneGetter = std::function<std::optional<osg::Matrixf>(std::string_view)>;
++
++        /// Whether the engine was built in (and its character loads).
++        static bool available();
++        static const std::string& lastError();
++
++        /// @param bone world matrices of the skeleton's bones (game units)
++        /// @param base the actor's base node (its position, heading and size)
++        /// @param heading the actor's (radians, 0: +Y, clockwise)
++        /// @param beast a beast race's skeleton (its own body: the legs)
++        /// @param dying it starts as its death (no balance)
++        /// @return null if this skeleton doesn't have the bones
++        static std::unique_ptr<DeliriumBody> create(
++            const BoneGetter& bone, const osg::Matrixf& base, const osg::Vec3f& position, float heading, bool beast,
++            bool dying);
++        ~DeliriumBody();
++
++        /// World triangles around it (game units, 3 vertices each); without any: a flat floor at its feet.
++        void setWorld(const std::vector<osg::Vec3f>& triangles);
++        /// Where it was made (the middle of its world).
++        const osg::Vec3f& getOrigin() const { return mOrigin; }
++
++        void step(float duration);
++
++        /// The bones' world matrices (game units), parents first; the pelvis is the first.
++        Poses getBonePoses() const;
++        osg::Vec3f getPelvisPosition() const;
++        /// The way it faces (flat, unit), from its hips.
++        osg::Vec3f getFacing() const;
++        float getHeadHeight() const; // game units over where it stood
++
++        struct Blow
++        {
++            std::optional<osg::Vec3f> mPoint; // where it landed (world), else the chest
++            osg::Vec3f mDirection; // the way it pushes (unit; zero: none)
++            float mPush = 0; // N s
++            float mHealth = 1; // what is left of its health (0-1)
++            bool mFall = false; // it must go down
++            std::optional<osg::Vec3f> mFrom; // whoever did it (world), to look at
++        };
++        /// @return what it does (for the diagnostics)
++        std::string hit(const Blow& blow);
++        /// It died: the killing blow as Delirium plays it, then limp.
++        void die(const osg::Vec3f& direction);
++
++        bool isDown() const { return mDown; }
++        bool isDying() const { return mDying; }
++        float getDownTime() const { return mDown ? mAge - mDownAt : 0.f; }
++        /// On its feet again and steady for this long (seconds).
++        float getCalmTime() const { return mCalm; }
++        /// Lying still for this long (seconds).
++        float getStillTime() const { return mStill; }
++        float getAge() const { return mAge; }
++        /// Something went wrong inside (not a number): it must be let go.
++        bool isBroken() const { return mBroken; }
++        /// Limp (knocked out): no getting up by itself.
++        void relax();
++
++    private:
++        DeliriumBody() = default;
++
++        struct V3
++        {
++            float x = 0, y = 0, z = 0;
++        };
++        struct Q
++        {
++            float x = 0, y = 0, z = 0, w = 1;
++        };
++        friend struct DeliriumMath;
++
++        void message(const char* name, bool start = true);
++        void partsFromBones(const BoneGetter& bone, std::array<V3, 21>& pos, std::array<Q, 21>& rot) const;
++        V3 toPhysics(const osg::Vec3f& world) const;
++        osg::Vec3f toWorld(const V3& physics) const;
++        void push(const V3& at, const V3& direction, float impulse);
++
++        NmAgent* mAgent = nullptr;
++        NmWorld* mWorld = nullptr;
++        osg::Vec3f mOrigin; // game units; the physics works in metres from here
++        osg::Matrixf mSize; // rigid (the body's) -> drawn (the actor's size, about where it stood)
++        osg::Matrixf mSizeInverse;
++        // The written bones: each one's place in its parent bone (parents first), from the skeleton as it was taken.
++        struct Bone
++        {
++            std::string mName;
++            int mPart; // the part whose turn it takes
++            int mParent; // index here, -1: the pelvis
++            V3 mInParent;
++        };
++        std::vector<Bone> mBones;
++        std::array<Q, 21> mRestRot;
++        std::array<V3, 21> mRestPos;
++        float mAge = 0;
++        float mSincePush = 10;
++        float mCalm = 0;
++        float mStill = 0;
++        float mOffBalance = 0;
++        bool mWasBalancing = false;
++        bool mDown = false;
++        float mDownAt = 0;
++        bool mDying = false;
++        bool mLimp = false;
++        float mRelaxAt = -1;
++        float mWritheFor = 0;
++        float mWritheUntil = -1;
++        bool mBroken = false;
++        bool mBeast = false;
 +    };
 +}
 +
@@ -3598,7 +4871,7 @@ index bacf68f7f..2065afe66 100644
  }
  
 diff --git a/apps/openmw/mwphysics/physicssystem.cpp b/apps/openmw/mwphysics/physicssystem.cpp
-index 3c2238bac..1c55cd1b8 100644
+index 3c2238bac..385e0e0f5 100644
 --- a/apps/openmw/mwphysics/physicssystem.cpp
 +++ b/apps/openmw/mwphysics/physicssystem.cpp
 @@ -10,11 +10,21 @@
@@ -4657,8 +5930,124 @@ index 3c2238bac..1c55cd1b8 100644
          mTaskScheduler->addCollisionObject(
              mWaterCollisionObject.get(), CollisionType_Water, CollisionType_Actor | CollisionType_Projectile);
      }
+@@ -863,6 +1771,115 @@ namespace MWPhysics
+         return callback.getResult();
+     }
+ 
++    namespace
++    {
++        struct StaticObjectsCallback : btBroadphaseAabbCallback
++        {
++            std::vector<const btCollisionObject*> mObjects;
++            bool process(const btBroadphaseProxy* proxy) override
++            {
++                constexpr int groups = CollisionType_World | CollisionType_Door | CollisionType_HeightMap;
++                if ((proxy->m_collisionFilterGroup & groups) == 0)
++                    return true;
++                const auto* object = static_cast<const btCollisionObject*>(proxy->m_clientObject);
++                if (object != nullptr && object->isStaticOrKinematicObject())
++                    mObjects.push_back(object);
++                return true;
++            }
++        };
++
++        struct GatherTriangles : btTriangleCallback
++        {
++            btTransform mToWorld;
++            std::vector<osg::Vec3f>* mOut;
++            size_t mMax;
++            bool mFaceUp = false;
++            void processTriangle(btVector3* triangle, int, int) override
++            {
++                if (mOut->size() + 3 > mMax * 3)
++                    return;
++                osg::Vec3f v[3];
++                for (int i = 0; i < 3; ++i)
++                    v[i] = Misc::Convert::toOsg(mToWorld * triangle[i]);
++                // The ground faces up.
++                if (mFaceUp && ((v[1] - v[0]) ^ (v[2] - v[0])).z() < 0)
++                    std::swap(v[1], v[2]);
++                mOut->insert(mOut->end(), { v[0], v[1], v[2] });
++            }
++        };
++
++        void gatherShape(const btCollisionShape* shape, const btTransform& toWorld, const btVector3& aabbMin,
++            const btVector3& aabbMax, std::vector<osg::Vec3f>& out, size_t maxTriangles)
++        {
++            if (shape == nullptr || out.size() >= maxTriangles * 3)
++                return;
++            if (shape->isCompound())
++            {
++                const auto* compound = static_cast<const btCompoundShape*>(shape);
++                for (int i = 0; i < compound->getNumChildShapes(); ++i)
++                    gatherShape(compound->getChildShape(i), toWorld * compound->getChildTransform(i), aabbMin, aabbMax,
++                        out, maxTriangles);
++                return;
++            }
++            btVector3 shapeMin, shapeMax;
++            shape->getAabb(toWorld, shapeMin, shapeMax);
++            if (shapeMin.x() > aabbMax.x() || shapeMax.x() < aabbMin.x() || shapeMin.y() > aabbMax.y()
++                || shapeMax.y() < aabbMin.y() || shapeMin.z() > aabbMax.z() || shapeMax.z() < aabbMin.z())
++                return;
++            if (shape->isConcave() && shape->getShapeType() != STATIC_PLANE_PROXYTYPE)
++            {
++                // The part of it inside the box, in its own space.
++                const btTransform toLocal = toWorld.inverse();
++                const btVector3 half = (aabbMax - aabbMin) * 0.5f;
++                const btVector3 center = toLocal * ((aabbMax + aabbMin) * 0.5f);
++                const btMatrix3x3 absolute = toLocal.getBasis().absolute();
++                const btVector3 extent(absolute[0].dot(half), absolute[1].dot(half), absolute[2].dot(half));
++                GatherTriangles gather;
++                gather.mToWorld = toWorld;
++                gather.mOut = &out;
++                gather.mMax = maxTriangles;
++                gather.mFaceUp = shape->getShapeType() == TERRAIN_SHAPE_PROXYTYPE;
++                static_cast<const btConcaveShape*>(shape)->processAllTriangles(&gather, center - extent, center + extent);
++                return;
++            }
++            if (!shape->isConvex())
++                return;
++            // Anything else: the box around it, in its own space.
++            btVector3 localMin, localMax;
++            shape->getAabb(btTransform::getIdentity(), localMin, localMax);
++            btVector3 corners[8];
++            for (int i = 0; i < 8; ++i)
++                corners[i] = toWorld
++                    * btVector3(i & 1 ? localMax.x() : localMin.x(), i & 2 ? localMax.y() : localMin.y(),
++                        i & 4 ? localMax.z() : localMin.z());
++            // outward faces
++            constexpr int faces[12][3] = { { 0, 2, 1 }, { 1, 2, 3 }, { 4, 5, 6 }, { 5, 7, 6 }, { 0, 1, 4 }, { 1, 5, 4 },
++                { 2, 6, 3 }, { 3, 6, 7 }, { 0, 4, 2 }, { 2, 4, 6 }, { 1, 3, 5 }, { 3, 7, 5 } };
++            for (const auto& face : faces)
++            {
++                if (out.size() + 3 > maxTriangles * 3)
++                    return;
++                for (int index : face)
++                    out.push_back(Misc::Convert::toOsg(corners[index]));
++            }
++        }
++    }
++
++    std::vector<osg::Vec3f> PhysicsSystem::getStaticTriangles(
++        const osg::Vec3f& center, float radius, float height, size_t maxTriangles) const
++    {
++        const btVector3 bulletCenter = Misc::Convert::toBullet(center);
++        const btVector3 aabbMin = bulletCenter - btVector3(radius, radius, height);
++        const btVector3 aabbMax = bulletCenter + btVector3(radius, radius, height);
++        StaticObjectsCallback callback;
++        mTaskScheduler->aabbTest(aabbMin, aabbMax, callback);
++        std::vector<osg::Vec3f> triangles;
++        for (const btCollisionObject* object : callback.mObjects)
++            gatherShape(object->getCollisionShape(), object->getWorldTransform(), aabbMin, aabbMax, triangles,
++                maxTriangles);
++        return triangles;
++    }
++
+     void PhysicsSystem::reportStats(unsigned int frameNumber, osg::Stats& stats) const
+     {
+         stats.setAttribute(frameNumber, "Physics Actors", static_cast<double>(mActors.size()));
 diff --git a/apps/openmw/mwphysics/physicssystem.hpp b/apps/openmw/mwphysics/physicssystem.hpp
-index 0ab0cf91a..061b9f2de 100644
+index 0ab0cf91a..cdaae54aa 100644
 --- a/apps/openmw/mwphysics/physicssystem.hpp
 +++ b/apps/openmw/mwphysics/physicssystem.hpp
 @@ -7,20 +7,28 @@
@@ -4741,7 +6130,7 @@ index 0ab0cf91a..061b9f2de 100644
      struct ContactPoint
      {
          MWWorld::Ptr mObject;
-@@ -163,6 +199,86 @@ namespace MWPhysics
+@@ -163,6 +199,90 @@ namespace MWPhysics
  
          void addObject(const MWWorld::Ptr& ptr, VFS::Path::NormalizedView mesh, osg::Quat rotation,
              int collisionType = CollisionType_World);
@@ -4777,6 +6166,10 @@ index 0ab0cf91a..061b9f2de 100644
 +        // Fisica (Delirium): see Ragdoll::setMuscles. @return false if it has no jointed ragdoll.
 +        bool setRagdollMuscles(const MWWorld::ConstPtr& actor, const MWMechanics::RagdollMuscles& muscles);
 +        bool hasRagdoll(const MWWorld::ConstPtr& actor) const;
++        // Fisica (Delirium): the world's collision (statics, doors, terrain) around center as triangles, three
++        // vertices each: within radius along the ground and height up and down. At most maxTriangles.
++        std::vector<osg::Vec3f> getStaticTriangles(
++            const osg::Vec3f& center, float radius, float height, size_t maxTriangles) const;
 +        /// Push the dead actor's ragdoll where it was hit (point, world space) with impulse. False without one.
 +        bool strikeRagdoll(const MWWorld::ConstPtr& actor, const osg::Vec3f& point, const osg::Vec3f& impulse);
 +
@@ -4828,7 +6221,7 @@ index 0ab0cf91a..061b9f2de 100644
          void addActor(const MWWorld::Ptr& ptr, VFS::Path::NormalizedView mesh);
  
          int addProjectile(
-@@ -199,8 +315,9 @@ namespace MWPhysics
+@@ -199,8 +319,9 @@ namespace MWPhysics
          void stepSimulation(
              float dt, bool skipSimulation, osg::Timer_t frameStart, unsigned int frameNumber, osg::Stats& stats);
  
@@ -4840,7 +6233,7 @@ index 0ab0cf91a..061b9f2de 100644
          void debugDraw();
  
          std::vector<MWWorld::Ptr> getCollisions(const MWWorld::ConstPtr& ptr, int collisionGroup,
-@@ -294,10 +411,20 @@ namespace MWPhysics
+@@ -294,10 +415,20 @@ namespace MWPhysics
  
          void prepareSimulation(bool willSimulate, std::vector<Simulation>& simulations);
  
@@ -4862,7 +6255,7 @@ index 0ab0cf91a..061b9f2de 100644
          std::unique_ptr<PhysicsTaskScheduler> mTaskScheduler;
  
          std::unique_ptr<Resource::BulletShapeManager> mShapeManager;
-@@ -306,6 +433,19 @@ namespace MWPhysics
+@@ -306,6 +437,19 @@ namespace MWPhysics
          using ObjectMap = std::unordered_map<const MWWorld::LiveCellRefBase*, std::shared_ptr<Object>>;
          ObjectMap mObjects;
  
@@ -8047,7 +9440,7 @@ index 316c1b9ef..061989d33 100644
          const auto cellX = cell->getCell()->getGridX();
          const auto cellY = cell->getCell()->getGridY();
 diff --git a/apps/openmw/mwworld/worldimp.cpp b/apps/openmw/mwworld/worldimp.cpp
-index c6cb28ae8..6d2a0c59b 100644
+index c6cb28ae8..2ace64fde 100644
 --- a/apps/openmw/mwworld/worldimp.cpp
 +++ b/apps/openmw/mwworld/worldimp.cpp
 @@ -65,9 +65,11 @@
@@ -8098,7 +9491,7 @@ index c6cb28ae8..6d2a0c59b 100644
          std::vector<std::pair<GlobalVariableName, ESM::Variant>> generateDefaultGlobals()
          {
              return {
-@@ -1367,14 +1384,370 @@ namespace MWWorld
+@@ -1367,14 +1384,375 @@ namespace MWWorld
          mPhysics->updateAnimatedCollisionShape(ptr);
      }
  
@@ -8208,6 +9601,11 @@ index c6cb28ae8..6d2a0c59b 100644
 +    void World::removeRagdoll(const MWWorld::ConstPtr& actor)
 +    {
 +        mPhysics->removeRagdoll(actor);
++    }
++
++    std::vector<osg::Vec3f> World::getStaticTriangles(const osg::Vec3f& center, float radius, float height) const
++    {
++        return mPhysics->getStaticTriangles(center, radius, height, 40000);
 +    }
 +
 +    bool World::makeLiveRagdoll(
@@ -8470,7 +9868,7 @@ index c6cb28ae8..6d2a0c59b 100644
      }
  
      void World::updateNavigator()
-@@ -1399,6 +1772,8 @@ namespace MWWorld
+@@ -1399,6 +1777,8 @@ namespace MWWorld
      {
          if (object.getShapeInstance()->mVisualCollisionType != Resource::VisualCollisionType::None)
              return;
@@ -8479,7 +9877,7 @@ index c6cb28ae8..6d2a0c59b 100644
          const MWWorld::Ptr ptr = object.getPtr();
          const DetourNavigator::ObjectShapes shapes(object.getShapeInstance(),
              DetourNavigator::ObjectTransform{ ptr.getRefData().getPosition(), ptr.getCellRef().getScale() });
-@@ -1674,8 +2049,8 @@ namespace MWWorld
+@@ -1674,8 +2054,8 @@ namespace MWWorld
      {
          try
          {
@@ -8490,7 +9888,7 @@ index c6cb28ae8..6d2a0c59b 100644
  
              // retrieve the object's top point's screen position so we know where to place the floating label
              if (!object.isEmpty())
-@@ -2016,6 +2391,10 @@ namespace MWWorld
+@@ -2016,6 +2396,10 @@ namespace MWWorld
                  moveObject(object, pos.asVec3());
              }
          }
@@ -8501,7 +9899,7 @@ index c6cb28ae8..6d2a0c59b 100644
      }
  
      MWWorld::Ptr World::dropObjectOnGround(const Ptr& actor, const Ptr& object, int amount, bool copy)
-@@ -2986,7 +3365,11 @@ namespace MWWorld
+@@ -2986,7 +3370,11 @@ namespace MWWorld
  
          if (result.mHit)
          {
@@ -8515,7 +9913,7 @@ index c6cb28ae8..6d2a0c59b 100644
          }
  
 diff --git a/apps/openmw/mwworld/worldimp.hpp b/apps/openmw/mwworld/worldimp.hpp
-index 3a6688d9a..f8373751a 100644
+index 3a6688d9a..cb092295e 100644
 --- a/apps/openmw/mwworld/worldimp.hpp
 +++ b/apps/openmw/mwworld/worldimp.hpp
 @@ -1,6 +1,10 @@
@@ -8538,7 +9936,7 @@ index 3a6688d9a..f8373751a 100644
          std::vector<std::string> mContentFiles;
  
          std::filesystem::path mUserDataPath;
-@@ -375,6 +381,33 @@ namespace MWWorld
+@@ -375,6 +381,34 @@ namespace MWWorld
          void rotateObject(const Ptr& ptr, const osg::Vec3f& rot,
              MWBase::RotationFlags flags = MWBase::RotationFlag_inverseOrder) override;
  
@@ -8559,6 +9957,7 @@ index 3a6688d9a..f8373751a 100644
 +        bool makeRagdoll(
 +            const MWWorld::Ptr& actor, const osg::Vec3f& kick, bool allowOnePiece, bool atRest) override;
 +        void removeRagdoll(const MWWorld::ConstPtr& actor) override;
++        std::vector<osg::Vec3f> getStaticTriangles(const osg::Vec3f& center, float radius, float height) const override;
 +        bool makeLiveRagdoll(
 +            const MWWorld::Ptr& actor, const osg::Vec3f& kick, const MWMechanics::RagdollMuscles& muscles) override;
 +        void knockObjectsWithMeleeAttack(const MWWorld::Ptr& attacker, const MWWorld::Ptr& weapon, int attackType,
@@ -8935,6 +10334,151 @@ index af28dc16f..4e68c3f88 100644
      template <class T>
      SettingValue<T>* find(std::string_view category, std::string_view name)
      {
+diff --git a/extern/delirium/delirium_physics.h b/extern/delirium/delirium_physics.h
+new file mode 100644
+index 000000000..e76c2216c
+--- /dev/null
++++ b/extern/delirium/delirium_physics.h
+@@ -0,0 +1,139 @@
++/* delirium_physics: the NM (Delirium) port's C API. Generated by crates/delirium-sdk/bindgen.py from src/lib.rs; edit that. */
++#ifndef DELIRIUM_PHYSICS_H
++#define DELIRIUM_PHYSICS_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#if defined(_WIN32) && !defined(DELIRIUM_PHYSICS_STATIC)
++#define NM_API __declspec(dllimport)
++#else
++#define NM_API
++#endif
++
++typedef struct NmWorld NmWorld;
++typedef struct NmBuild NmBuild;
++typedef struct NmAgent NmAgent;
++
++#define NM_E_ARG (-1)
++#define NM_E_IO (-2)
++#define NM_E_PARSE (-3)
++#define NM_E_MESSAGE (-4)
++#define NM_E_PARAM (-5)
++#define NM_E_TYPE (-6)
++#define NM_E_STATE (-7)
++#define NM_E_FOLLOW (-8)
++#define NM_MODE_LEAD (0)
++#define NM_MODE_FOLLOW (1)
++#define NM_KIND_FLOAT (0)
++#define NM_KIND_INT (1)
++#define NM_KIND_BOOL (2)
++#define NM_KIND_VEC3 (3)
++#define NM_KIND_STRING (4)
++
++NM_API int32_t nm_version(void);
++NM_API int32_t nm_last_error(char* buf, int32_t len);
++NM_API int32_t nm_init_memory(const uint8_t* xrt, int32_t len);
++NM_API int32_t nm_init(const char* xrt_path);
++NM_API int32_t nm_load_task_params(const char* path);
++NM_API int32_t nm_set_task_param(const char* task, const char* set, const char* name, float value);
++NM_API int32_t nm_part_name(int32_t i, char* buf, int32_t len);
++NM_API NmWorld* nm_world_create(void);
++NM_API void nm_world_destroy(NmWorld* w);
++NM_API int32_t nm_world_add_mesh(NmWorld* w, const float* positions, int32_t vertices, const uint32_t* triangles, int32_t count, const uint8_t* materials);
++NM_API int32_t nm_world_add_floor(NmWorld* w, float x, float y, float z, float half);
++NM_API int32_t nm_world_set_boxes(NmWorld* w, const float* boxes, int32_t count);
++NM_API int32_t nm_set_surface(int32_t material, float friction, float elasticity);
++NM_API int32_t nm_world_triangle_count(const NmWorld* w);
++NM_API int32_t nm_world_raycast(const NmWorld* w, const float* from, const float* dir, float len, float* dist, float* normal);
++NM_API NmBuild* nm_build_from_text(const char* t);
++NM_API NmBuild* nm_build_load(const char* path);
++/* Part `i`'s joint with its parent (the root's: its centre), world, in the build's pose. */
++NM_API int32_t nm_build_part_joint(const NmBuild* b, int32_t i, float* pos);
++/* `build` kept in its own pose, each part's bone (to its children's joints) stretched by `len[i]` (21 floats), and girth and masses scaled so the whole body weighs `mass` times the original. Unlike nm_build_fit it doesn't take another skeleton's pose. */
++NM_API NmBuild* nm_build_scale(const NmBuild* build, const float* len, float mass);
++/* Writes the build as a dump `nm_build_load` and the room read back. Mass overrides (size, heft) aren't in the format: a loaded copy weighs the character file's masses. */
++NM_API int32_t nm_build_save(const NmBuild* b, const char* path);
++NM_API void nm_build_destroy(NmBuild* b);
++NM_API int32_t nm_build_part_count(const NmBuild* b);
++NM_API int32_t nm_build_part_info(const NmBuild* b, int32_t i, float* mass, float* radius, float* half, int32_t* parent);
++/* Sets part `i`'s mass to `kg` (inertia follows), keeping its shape: for a fitted build whose cubed length scale overweights some parts. Agents made from the build afterwards use it. */
++NM_API int32_t nm_build_set_mass(NmBuild* b, int32_t i, float kg);
++NM_API NmBuild* nm_build_fit(const NmBuild* build, const float* joints);
++/* Rebuilds a 21-part build on another skeleton's bind pose: `joints` (21 x xyz, world) is where each part's joint goes (the root's: its origin), `rots` (21 x quaternion xyzw) how each part is turned. A part with one child is stretched to the skeleton's joint distance; with bit (1 << part) set in `align` it is also turned on until its joint -> child joint line runs along the skeleton's. Shapes, joint limits and muscles stay in each part's own frame. Returns a new build (free with nm_build_free) or null. */
++NM_API NmBuild* nm_build_remap(const NmBuild* build, const float* joints, const float* rots, uint32_t align);
++NM_API int32_t nm_build_part_frame(const NmBuild* b, int32_t i, float* pos, float* rot);
++/* Moves part `i`'s joint limits on by `rot` (quaternion xyzw: a turn of the part in its parent's frame), so they are centred on a stance the body was not built for (a hunched creature on a person's body). Its rest moves with them. Agents made from the build afterwards use it. Fails for the root. */
++NM_API int32_t nm_build_turn_limit(NmBuild* b, int32_t i, const float* rot);
++NM_API NmAgent* nm_agent_create(const NmBuild* b, const float* pos, float yaw, float seed);
++NM_API void nm_agent_destroy(NmAgent* a);
++NM_API int32_t nm_agent_step(NmAgent* a, const NmWorld* w, float dt);
++NM_API int32_t nm_agent_set_mode(NmAgent* a, int32_t mode);
++NM_API int32_t nm_agent_get_mode(const NmAgent* a);
++NM_API int32_t nm_agent_part_count(const NmAgent* a);
++NM_API int32_t nm_agent_get_part_transform(const NmAgent* a, int32_t i, float* pos, float* rot);
++NM_API int32_t nm_agent_get_part_transforms(const NmAgent* a, float* out, int32_t parts);
++NM_API int32_t nm_agent_get_part_velocity(const NmAgent* a, int32_t i, float* vel, float* angvel);
++NM_API int32_t nm_agent_set_part_state(NmAgent* a, int32_t i, const float* pos, const float* rot, const float* vel, const float* angvel);
++NM_API int32_t nm_agent_set_part_states(NmAgent* a, const float* states, int32_t parts);
++NM_API int32_t nm_agent_set_incoming_transforms(NmAgent* a, const float* transforms, int32_t parts);
++/* The pose the agent's muscles and balance hold (its "zero pose"), from every part's world transform (7 floats each: position, quaternion xyzw). By default it is the build's own pose; a host game sets its animation's pose here, once or every frame, so the body keeps that posture instead of the build's. */
++NM_API int32_t nm_agent_set_zero_pose(NmAgent* a, const float* transforms, int32_t parts);
++NM_API int32_t nm_agent_get_part_drive(const NmAgent* a, int32_t i, float* force, float* torque);
++NM_API int32_t nm_agent_get_part_drives(const NmAgent* a, float* out, int32_t parts);
++NM_API int32_t nm_agent_get_joint_accels(const NmAgent* a, float* out, int32_t parts);
++NM_API int32_t nm_agent_get_part_ext_torques(const NmAgent* a, float* out, int32_t parts);
++NM_API int32_t nm_agent_get_part_contact(const NmAgent* a, int32_t i);
++NM_API int32_t nm_agent_get_com(const NmAgent* a, float* pos, float* vel);
++NM_API float nm_agent_get_mass(const NmAgent* a);
++NM_API float nm_agent_get_kinetic_energy(const NmAgent* a);
++NM_API int32_t nm_agent_apply_impulse(NmAgent* a, int32_t i, const float* at, const float* impulse);
++NM_API int32_t nm_agent_apply_push(NmAgent* a, const float* at, const float* impulse);
++NM_API int32_t nm_agent_nearest_part(const NmAgent* a, const float* at);
++NM_API int32_t nm_agent_raycast(const NmAgent* a, const float* from, const float* to, float* point, float* normal);
++NM_API int32_t nm_agent_add_velocity(NmAgent* a, const float* dv);
++NM_API int32_t nm_agent_get_joint(const NmAgent* a, int32_t i, int32_t* parent, float* pivot, float* frame, float* limits, float* armature);
++NM_API int32_t nm_message_count(void);
++NM_API int32_t nm_message_name(int32_t m, char* buf, int32_t len);
++NM_API int32_t nm_message_find(const char* name);
++NM_API int32_t nm_message_param_count(int32_t m);
++NM_API int32_t nm_message_param_name(int32_t m, int32_t p, char* buf, int32_t len);
++NM_API int32_t nm_message_param_find(int32_t m, const char* name);
++NM_API int32_t nm_message_param_kind(int32_t m, int32_t p);
++NM_API int32_t nm_message_param_used(int32_t m, int32_t p);
++NM_API int32_t nm_message_param_doc(int32_t m, int32_t p, char* buf, int32_t len);
++NM_API int32_t nm_message_param_default(int32_t m, int32_t p, float* out);
++NM_API int32_t nm_msg_begin(NmAgent* a, const char* name);
++NM_API int32_t nm_msg_set_float(NmAgent* a, const char* name, float v);
++NM_API int32_t nm_msg_set_int(NmAgent* a, const char* name, int32_t v);
++NM_API int32_t nm_msg_set_bool(NmAgent* a, const char* name, int32_t v);
++NM_API int32_t nm_msg_set_vec3(NmAgent* a, const char* name, const float* v);
++NM_API int32_t nm_msg_set_string(NmAgent* a, const char* name, const char* v);
++NM_API int32_t nm_msg_send(NmAgent* a, const NmWorld* w);
++NM_API int32_t nm_msg_cancel(NmAgent* a);
++NM_API int32_t nm_agent_get_param(const NmAgent* a, const char* message, const char* param, float* out);
++NM_API int32_t nm_agent_get_param_string(const NmAgent* a, const char* message, const char* param, char* buf, int32_t len);
++NM_API int32_t nm_agent_is_balancing(const NmAgent* a);
++NM_API int32_t nm_agent_has_fallen(const NmAgent* a);
++NM_API int32_t nm_agent_is_settled(const NmAgent* a);
++NM_API int32_t nm_agent_is_relaxing(const NmAgent* a);
++NM_API int32_t nm_agent_is_catching_fall(const NmAgent* a);
++NM_API int32_t nm_agent_is_rolled_up(const NmAgent* a);
++NM_API int32_t nm_agent_is_awake(const NmAgent* a);
++NM_API int32_t nm_agent_get_stance(const NmAgent* a, float* pos);
++NM_API int32_t nm_agent_feedback_count(const NmAgent* a);
++NM_API int32_t nm_agent_feedback_get(const NmAgent* a, int32_t i, char* buf, int32_t len, int32_t* slot, float* value);
++NM_API int32_t nm_agent_task_shot(NmAgent* a, const NmWorld* w, const char* set, int32_t part, const float* at, const float* dir, float health);
++NM_API int32_t nm_agent_task_balance(NmAgent* a, const NmWorld* w, const char* set, const float* look);
++NM_API int32_t nm_agent_task_catch_fall(NmAgent* a, const char* set);
++NM_API int32_t nm_agent_task_flinch(NmAgent* a, const NmWorld* w, const char* set, const float* from);
++NM_API int32_t nm_init_character(const char* json);
++NM_API int32_t nm_init_character_file(const char* path);
++NM_API NmBuild* nm_build_from_character(const char* json);
++NM_API int32_t nm_character_from_xrt(const char* xrt_path, const char* build_path, char* buf, int32_t len);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
 diff --git a/files/data/CMakeLists.txt b/files/data/CMakeLists.txt
 index 4b1b9e01c..046159cfd 100644
 --- a/files/data/CMakeLists.txt
