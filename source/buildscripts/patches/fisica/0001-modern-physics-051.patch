@@ -838,7 +838,7 @@ index 61a148b7e..e778a172d 100644
          ++mDeathCount[actor.getCellRef().getRefId()];
  
 diff --git a/apps/openmw/mwmechanics/character.cpp b/apps/openmw/mwmechanics/character.cpp
-index 664f293fb..75c432239 100644
+index 664f293fb..88458c127 100644
 --- a/apps/openmw/mwmechanics/character.cpp
 +++ b/apps/openmw/mwmechanics/character.cpp
 @@ -50,7 +50,9 @@
@@ -960,11 +960,15 @@ index 664f293fb..75c432239 100644
              resetCurrentIdleState();
              return Result_DeathAnimStarted;
          }
-@@ -2798,6 +2864,14 @@ namespace MWMechanics
+@@ -2798,6 +2864,18 @@ namespace MWMechanics
  
      void CharacterController::resurrect()
      {
-+        mDelirium.reset();
++        {
++            mDelirium.reset();
++            if (mAnimation != nullptr)
++                mAnimation->setPoseLocked(false);
++        }
 +        if (mRagdoll)
 +        {
 +            MWBase::Environment::get().getWorld()->removeRagdoll(mPtr);
@@ -975,7 +979,7 @@ index 664f293fb..75c432239 100644
          if (mDeathState == CharState_None)
              return;
  
-@@ -2805,6 +2879,671 @@ namespace MWMechanics
+@@ -2805,6 +2883,685 @@ namespace MWMechanics
          mWeaponType = ESM::Weapon::None;
      }
  
@@ -1315,6 +1319,8 @@ index 664f293fb..75c432239 100644
 +            return false;
 +        mDeliriumWorldTimer = 0;
 +        gatherDeliriumWorld();
++        mAnimation->stopAllAnimations();
++        mAnimation->setPoseLocked(true);
 +        // As for a knockdown: whatever it was doing ends.
 +        CreatureStats& stats = mPtr.getClass().getCreatureStats(mPtr);
 +        stats.setHitRecovery(false);
@@ -1406,7 +1412,11 @@ index 664f293fb..75c432239 100644
 +            if (!knockout
 +                && ((mDelirium->getStillTime() > 0.4f && downTime > getUpTime) || downTime > getUpTime + 5.f))
 +            {
-+                mDelirium.reset();
++                {
++            mDelirium.reset();
++            if (mAnimation != nullptr)
++                mAnimation->setPoseLocked(false);
++        }
 +                getUpFromRagdoll(poses);
 +            }
 +        }
@@ -1425,7 +1435,11 @@ index 664f293fb..75c432239 100644
 +        const std::vector<std::pair<std::string, osg::Matrixf>> poses = mDelirium->getBonePoses();
 +        const osg::Vec3f facing = mDelirium->getFacing();
 +        const bool down = mDelirium->isDown();
-+        mDelirium.reset();
++        {
++            mDelirium.reset();
++            if (mAnimation != nullptr)
++                mAnimation->setPoseLocked(false);
++        }
 +        world->setActorCollisionMode(mPtr, true, true);
 +        if (down)
 +        {
@@ -1571,7 +1585,11 @@ index 664f293fb..75c432239 100644
 +            if (broken || (mDelirium->isDown() && mDelirium->getStillTime() > 1.2f && mDelirium->getAge() > 3.f)
 +                || mDelirium->getAge() > 10.f)
 +            {
-+                mDelirium.reset();
++                {
++            mDelirium.reset();
++            if (mAnimation != nullptr)
++                mAnimation->setPoseLocked(false);
++        }
 +                MWBase::Environment::get().getWorld()->makeRagdoll(mPtr, osg::Vec3f(), false, !broken);
 +            }
 +            return;
@@ -7454,7 +7472,7 @@ index 000000000..1804206d7
 +
 +#endif
 diff --git a/apps/openmw/mwrender/animation.cpp b/apps/openmw/mwrender/animation.cpp
-index 492030577..308069b2a 100644
+index 492030577..0105b7cfd 100644
 --- a/apps/openmw/mwrender/animation.cpp
 +++ b/apps/openmw/mwrender/animation.cpp
 @@ -3,13 +3,19 @@
@@ -7494,7 +7512,17 @@ index 492030577..308069b2a 100644
  #include "../mwmechanics/weapontype.hpp"
  
  #include "actorutil.hpp"
-@@ -1050,6 +1059,354 @@ namespace MWRender
+@@ -887,6 +896,9 @@ namespace MWRender
+         float speedmult, std::string_view start, std::string_view stop, float startpoint, uint32_t loops,
+         bool loopfallback)
+     {
++        // Fisica: a physical body has the bones (Delirium); nobody's animation gets in.
++        if (mPoseLocked)
++            return;
+         if (!mObjectRoot || mAnimSources.empty())
+             return;
+ 
+@@ -1050,6 +1062,354 @@ namespace MWRender
          mTextKeyListener = listener;
      }
  
@@ -7849,7 +7877,7 @@ index 492030577..308069b2a 100644
      const Animation::NodeMap& Animation::getNodeMap() const
      {
          if (!mNodeMapCreated && mObjectRoot)
-@@ -1337,8 +1694,72 @@ namespace MWRender
+@@ -1337,8 +1697,72 @@ namespace MWRender
          position += off - osg::componentMultiply(mAccumCtrl->getTranslation(oldtime), mAccumulate);
      }
  
@@ -7922,7 +7950,7 @@ index 492030577..308069b2a 100644
          osg::Vec3f movement(0.f, 0.f, 0.f);
          AnimStateMap::iterator stateiter = mStates.begin();
          while (stateiter != mStates.end())
-@@ -1659,6 +2080,10 @@ namespace MWRender
+@@ -1659,6 +2083,10 @@ namespace MWRender
          mObjectRoot->addCullCallback(mLightListCallback);
          if (mTransparencyUpdater)
              mObjectRoot->addCullCallback(mTransparencyUpdater);
@@ -7933,7 +7961,7 @@ index 492030577..308069b2a 100644
      }
  
      osg::Group* Animation::getObjectRoot()
-@@ -1931,6 +2356,63 @@ namespace MWRender
+@@ -1931,6 +2359,63 @@ namespace MWRender
          mHeadController = addRotateController("bip01 head");
          mSpineController = addRotateController("bip01 spine1");
          mRootController = addRotateController("bip01");
@@ -7998,7 +8026,7 @@ index 492030577..308069b2a 100644
  
      osg::ref_ptr<RotateController> Animation::addRotateController(std::string_view bone)
 diff --git a/apps/openmw/mwrender/animation.hpp b/apps/openmw/mwrender/animation.hpp
-index 7111d3df1..76cac83d3 100644
+index 7111d3df1..cb68a7f10 100644
 --- a/apps/openmw/mwrender/animation.hpp
 +++ b/apps/openmw/mwrender/animation.hpp
 @@ -17,6 +17,10 @@
@@ -8040,7 +8068,7 @@ index 7111d3df1..76cac83d3 100644
          float mHeadYawRadians;
          float mHeadPitchRadians;
          float mUpperBodyYawRadians;
-@@ -449,6 +467,65 @@ namespace MWRender
+@@ -449,6 +467,69 @@ namespace MWRender
          /// @note The matching is case-insensitive.
          const osg::Node* getNode(std::string_view name) const;
  
@@ -8055,6 +8083,10 @@ index 7111d3df1..76cac83d3 100644
 +        /// seconds (getting up).
 +        void blendFromPose(const std::vector<std::pair<std::string, osg::Matrixf>>& worldPoses, float seconds);
 +        /// Fisica (Delirium): is any animation group playing (one a mod started over a ragdoll, say)?
++        /// Fisica: while set, play() does nothing (a physical body has the bones).
++        bool mPoseLocked = false;
++        void setPoseLocked(bool locked) { mPoseLocked = locked; }
++        bool isPoseLocked() const { return mPoseLocked; }
 +        bool hasActiveAnimations() const { return !mStates.empty(); }
 +        void setBoneWorldMatrix(std::string_view bone, const osg::Matrixf& world);
 +        /// Stop every animation, leaving the bones as they are.
