@@ -838,7 +838,7 @@ index 61a148b7e..e778a172d 100644
          ++mDeathCount[actor.getCellRef().getRefId()];
  
 diff --git a/apps/openmw/mwmechanics/character.cpp b/apps/openmw/mwmechanics/character.cpp
-index 664f293fb..8db5c09f9 100644
+index 664f293fb..431514c9a 100644
 --- a/apps/openmw/mwmechanics/character.cpp
 +++ b/apps/openmw/mwmechanics/character.cpp
 @@ -50,7 +50,9 @@
@@ -878,10 +878,48 @@ index 664f293fb..8db5c09f9 100644
          playDeath(startpoint, mDeathState);
      }
  
-@@ -1972,6 +1994,18 @@ namespace MWMechanics
+@@ -1972,6 +1994,56 @@ namespace MWMechanics
          osg::Vec3f movement(0.f, 0.f, 0.f);
          float speed = 0.f;
  
++        // Fisica (diagnostics): bones torn apart (a child away from where its parent has it) since the last frame.
++        if (deliriumConfig().mDebug && cls.isActor() && mPtr != getPlayer())
++        {
++            static const char* const pairs[][2] = { { "Bip01 Spine", "Bip01 Pelvis" }, { "Bip01 Spine1", "Bip01 Spine" },
++                { "Bip01 Spine2", "Bip01 Spine1" }, { "Bip01 Neck", "Bip01 Spine2" }, { "Bip01 Head", "Bip01 Neck" },
++                { "Bip01 L Thigh", "Bip01 Spine" }, { "Bip01 L Calf", "Bip01 L Thigh" }, { "Bip01 L Foot", "Bip01 L Calf" },
++                { "Bip01 L UpperArm", "Bip01 L Clavicle" }, { "Bip01 L Forearm", "Bip01 L UpperArm" } };
++            if (mDeliriumRest.empty())
++                for (const auto& pair : pairs)
++                {
++                    const auto a = mAnimation->getBoneWorldMatrix(pair[0]);
++                    const auto b = mAnimation->getBoneWorldMatrix(pair[1]);
++                    mDeliriumRest.push_back(a && b ? (a->getTrans() - b->getTrans()).length() : -1.f);
++                }
++            else
++            {
++                float worst = 0;
++                const char* which = "";
++                for (size_t i = 0; i < mDeliriumRest.size(); ++i)
++                {
++                    const auto a = mAnimation->getBoneWorldMatrix(pairs[i][0]);
++                    const auto b = mAnimation->getBoneWorldMatrix(pairs[i][1]);
++                    if (!a || !b || mDeliriumRest[i] < 0)
++                        continue;
++                    const float off = std::abs((a->getTrans() - b->getTrans()).length() - mDeliriumRest[i]);
++                    if (off > worst)
++                    {
++                        worst = off;
++                        which = pairs[i][0];
++                    }
++                }
++                if (worst > 2.f)
++                    Log(Debug::Info) << "Delirium: ROTO " << cls.getName(mPtr) << " " << which << " " << worst
++                                     << " (cuerpo " << (mDelirium != nullptr) << ", muerto "
++                                     << cls.getCreatureStats(mPtr).isDead() << ")";
++            }
++        }
++
 +        // Fisica ("Precision"): a blow landed, the animation holds for an instant.
 +        if (cls.isActor())
 +        {
@@ -897,7 +935,7 @@ index 664f293fb..8db5c09f9 100644
          updateMagicEffects();
  
          bool isPlayer = mPtr == MWMechanics::getPlayer();
-@@ -1994,8 +2028,17 @@ namespace MWMechanics
+@@ -1994,8 +2066,17 @@ namespace MWMechanics
              cls.getCreatureStats(mPtr).setTeleported(false);
          }
  
@@ -915,7 +953,7 @@ index 664f293fb..8db5c09f9 100644
          else if (!cls.getCreatureStats(mPtr).isDead())
          {
              bool onground = world->isOnGround(mPtr);
-@@ -2437,6 +2480,15 @@ namespace MWMechanics
+@@ -2437,6 +2518,15 @@ namespace MWMechanics
          }
          else if (cls.getCreatureStats(mPtr).isDead())
          {
@@ -931,7 +969,7 @@ index 664f293fb..8db5c09f9 100644
              // initial start of death animation for actors that started the game as dead
              // not done in constructor since we need to give scripts a chance to set the mSkipAnim flag
              if (!mSkipAnim && mDeathState != CharState_None && mCurrentDeath.empty())
-@@ -2447,6 +2499,18 @@ namespace MWMechanics
+@@ -2447,6 +2537,18 @@ namespace MWMechanics
              }
          }
  
@@ -950,7 +988,7 @@ index 664f293fb..8db5c09f9 100644
          osg::Vec3f movementFromAnimation
              = mAnimation->runAnimation(mSkipAnim && !isScriptedAnimPlaying() ? 0.f : duration);
  
-@@ -2780,7 +2844,9 @@ namespace MWMechanics
+@@ -2780,7 +2882,9 @@ namespace MWMechanics
      {
          if (mDeathState == CharState_None)
          {
@@ -960,7 +998,7 @@ index 664f293fb..8db5c09f9 100644
              resetCurrentIdleState();
              return Result_DeathAnimStarted;
          }
-@@ -2798,6 +2864,18 @@ namespace MWMechanics
+@@ -2798,6 +2902,18 @@ namespace MWMechanics
  
      void CharacterController::resurrect()
      {
@@ -979,7 +1017,7 @@ index 664f293fb..8db5c09f9 100644
          if (mDeathState == CharState_None)
              return;
  
-@@ -2805,6 +2883,698 @@ namespace MWMechanics
+@@ -2805,6 +2921,699 @@ namespace MWMechanics
          mWeaponType = ESM::Weapon::None;
      }
  
@@ -1325,6 +1363,7 @@ index 664f293fb..8db5c09f9 100644
 +            return false;
 +        mDeliriumWorldTimer = 0;
 +        gatherDeliriumWorld();
++        mAnimation->cancelPoseBlend();
 +        mAnimation->stopAllAnimations();
 +        mAnimation->setPoseLocked(true);
 +        // As for a knockdown: whatever it was doing ends.
@@ -1679,7 +1718,7 @@ index 664f293fb..8db5c09f9 100644
      {
          // Keeping track of when to stop a continuous VFX seems to be very difficult to do inside the spells code,
 diff --git a/apps/openmw/mwmechanics/character.hpp b/apps/openmw/mwmechanics/character.hpp
-index a07fe7204..72845868c 100644
+index a07fe7204..bcf1144d3 100644
 --- a/apps/openmw/mwmechanics/character.hpp
 +++ b/apps/openmw/mwmechanics/character.hpp
 @@ -9,6 +9,8 @@
@@ -1691,7 +1730,7 @@ index a07fe7204..72845868c 100644
  namespace MWWorld
  {
      class InventoryStore;
-@@ -163,6 +165,24 @@ namespace MWMechanics
+@@ -163,6 +165,25 @@ namespace MWMechanics
          std::string mCurrentHit;
  
          UpperBodyState mUpperBodyState{ UpperBodyState::None };
@@ -1710,13 +1749,14 @@ index a07fe7204..72845868c 100644
 +        std::unique_ptr<DeliriumBody> mDelirium;
 +        float mDeliriumDuration = 0; // this frame's
 +        float mDeliriumWorldTimer = 0;
++        std::vector<float> mDeliriumRest; // diagnostics: bone lengths
 +        float mHitStop = 0; // seconds left of the freeze after a blow
 +        bool mDeliriumKnocked = false; // last frame's knockdown or knockout
 +        bool mDying = false; // in kill()
          bool mResetIdleOnAttackEnd{ false };
  
          JumpingState mJumpState{ JumpState_None };
-@@ -231,6 +251,24 @@ namespace MWMechanics
+@@ -231,6 +252,24 @@ namespace MWMechanics
          void updateMagicEffects() const;
  
          void playDeath(float startpoint, CharacterState death);
@@ -1741,7 +1781,7 @@ index a07fe7204..72845868c 100644
          CharacterState chooseRandomDeathState() const;
          void playRandomDeath(float startpoint = 0.0f);
  
-@@ -311,6 +349,7 @@ namespace MWMechanics
+@@ -311,6 +350,7 @@ namespace MWMechanics
          bool isCastingSpell() const;
          bool isReadyToBlock() const;
          bool isKnockedDown() const;
@@ -7493,7 +7533,7 @@ index 000000000..1804206d7
 +
 +#endif
 diff --git a/apps/openmw/mwrender/animation.cpp b/apps/openmw/mwrender/animation.cpp
-index 492030577..8026d4769 100644
+index 492030577..8c04f464b 100644
 --- a/apps/openmw/mwrender/animation.cpp
 +++ b/apps/openmw/mwrender/animation.cpp
 @@ -3,13 +3,20 @@
@@ -7589,7 +7629,7 @@ index 492030577..8026d4769 100644
 +            return;
 +        osg::NodePath& toParent = paths.front();
 +        toParent.pop_back();
-+        found->second->setMatrix(world * osg::Matrixf::inverse(osg::computeLocalToWorld(toParent)));
++        found->second->setMatrix(osg::Matrixd(world) * osg::Matrixd::inverse(osg::computeLocalToWorld(toParent)));
 +    }
 +
 +    void Animation::stopAllAnimations()
@@ -7977,7 +8017,7 @@ index 492030577..8026d4769 100644
          AnimStateMap::iterator iter = mStates.find(groupname);
          if (iter != mStates.end())
          {
-@@ -1337,8 +1767,72 @@ namespace MWRender
+@@ -1337,8 +1767,98 @@ namespace MWRender
          position += off - osg::componentMultiply(mAccumCtrl->getTranslation(oldtime), mAccumulate);
      }
  
@@ -7989,14 +8029,20 @@ index 492030577..8026d4769 100644
 +            float mWeight = 0;
 +        };
 +
-+        // After the bone's keyframes: its world matrix between where the ragdoll left it and the animation's.
++        // After the bone's keyframes: between the pose a physical body left and the animation's. Every bone but the
++        // first turns in its parent bone (its place there stays the skeleton's: nothing stretches, and the pose goes
++        // wherever the actor goes); the first (the pelvis) blends its place and turn in the actor's space.
 +        class PoseBlendController : public SceneUtil::NodeCallback<PoseBlendController, osg::MatrixTransform*>
 +        {
 +        public:
-+            PoseBlendController(PoseBlendState* state, const osg::Matrixf& world)
++            PoseBlendController(PoseBlendState* state, const osg::Matrixf& pose, const osg::Node* base)
 +                : mState(state)
-+                , mWorld(world)
++                , mPose(pose)
++                , mBase(base)
 +            {
++                osg::Vec3f translation, scale;
++                osg::Quat so;
++                mPose.decompose(translation, mRotation, scale, so);
 +            }
 +
 +            void operator()(osg::MatrixTransform* node, osg::NodeVisitor* nv)
@@ -8004,24 +8050,42 @@ index 492030577..8026d4769 100644
 +                const float weight = mState->mWeight;
 +                if (weight > 0)
 +                {
-+                    osg::NodePathList paths = node->getParentalNodePaths();
-+                    if (!paths.empty())
++                    const float w = weight * weight * (3 - 2 * weight);
++                    if (mBase == nullptr)
 +                    {
-+                        osg::NodePath& toParent = paths.front();
-+                        toParent.pop_back();
-+                        const osg::Matrixf parentWorld = osg::computeLocalToWorld(toParent);
-+                        const osg::Matrixf animated = osg::Matrixf(node->getMatrix()) * parentWorld;
-+                        osg::Vec3f animTrans, ragTrans, animScale, ragScale;
-+                        osg::Quat animRot, ragRot, so;
-+                        animated.decompose(animTrans, animRot, animScale, so);
-+                        mWorld.decompose(ragTrans, ragRot, ragScale, so);
-+                        const float w = weight * weight * (3 - 2 * weight);
-+                        osg::Quat rot;
-+                        rot.slerp(w, animRot, ragRot);
-+                        const osg::Vec3f trans = animTrans * (1 - w) + ragTrans * w;
-+                        const osg::Matrixf world
-+                            = osg::Matrixf::scale(animScale) * osg::Matrixf::rotate(rot) * osg::Matrixf::translate(trans);
-+                        node->setMatrix(world * osg::Matrixf::inverse(parentWorld));
++                        osg::Vec3f translation, scale;
++                        osg::Quat rotation, so;
++                        osg::Matrixf(node->getMatrix()).decompose(translation, rotation, scale, so);
++                        osg::Quat blended;
++                        blended.slerp(w, rotation, mRotation);
++                        node->setMatrix(osg::Matrixf::scale(scale) * osg::Matrixf::rotate(blended)
++                            * osg::Matrixf::translate(translation));
++                    }
++                    else
++                    {
++                        osg::NodePathList paths = node->getParentalNodePaths();
++                        if (!paths.empty())
++                        {
++                            osg::NodePath& toParent = paths.front();
++                            toParent.pop_back();
++                            const auto base = std::find(toParent.begin(), toParent.end(), mBase);
++                            if (base != toParent.end())
++                            {
++                                // parent bone <- actor
++                                const osg::Matrixd parentInBase
++                                    = osg::computeLocalToWorld(osg::NodePath(base + 1, toParent.end()));
++                                const osg::Matrixf animated = osg::Matrixf(node->getMatrix() * parentInBase);
++                                osg::Vec3f animTrans, animScale, poseTrans, poseScale;
++                                osg::Quat animRot, poseRot, so;
++                                animated.decompose(animTrans, animRot, animScale, so);
++                                mPose.decompose(poseTrans, poseRot, poseScale, so);
++                                osg::Quat rotation;
++                                rotation.slerp(w, animRot, poseRot);
++                                const osg::Matrixd inBase = osg::Matrixd::scale(animScale) * osg::Matrixd::rotate(rotation)
++                                    * osg::Matrixd::translate(animTrans * (1 - w) + poseTrans * w);
++                                node->setMatrix(inBase * osg::Matrixd::inverse(parentInBase));
++                            }
++                        }
 +                    }
 +                }
 +                traverse(node, nv);
@@ -8029,7 +8093,9 @@ index 492030577..8026d4769 100644
 +
 +        private:
 +            osg::ref_ptr<PoseBlendState> mState;
-+            osg::Matrixf mWorld;
++            osg::Matrixf mPose; // in its parent bone, or (the first) in the actor
++            osg::Quat mRotation;
++            const osg::Node* mBase; // the actor's node, for the first bone
 +        };
 +    }
 +
@@ -8050,7 +8116,7 @@ index 492030577..8026d4769 100644
          osg::Vec3f movement(0.f, 0.f, 0.f);
          AnimStateMap::iterator stateiter = mStates.begin();
          while (stateiter != mStates.end())
-@@ -1659,6 +2153,10 @@ namespace MWRender
+@@ -1659,6 +2179,10 @@ namespace MWRender
          mObjectRoot->addCullCallback(mLightListCallback);
          if (mTransparencyUpdater)
              mObjectRoot->addCullCallback(mTransparencyUpdater);
@@ -8061,7 +8127,7 @@ index 492030577..8026d4769 100644
      }
  
      osg::Group* Animation::getObjectRoot()
-@@ -1931,6 +2429,63 @@ namespace MWRender
+@@ -1931,6 +2455,94 @@ namespace MWRender
          mHeadController = addRotateController("bip01 head");
          mSpineController = addRotateController("bip01 spine1");
          mRootController = addRotateController("bip01");
@@ -8095,15 +8161,45 @@ index 492030577..8026d4769 100644
 +    void Animation::blendFromPose(
 +        const std::vector<std::pair<std::string, osg::Matrixf>>& worldPoses, float seconds)
 +    {
-+        if (seconds <= 0)
++        cancelPoseBlend();
++        if (seconds <= 0 || worldPoses.empty())
 +            return;
++        // The bones as the body left them, where the actor is now; then what each keeps of it (see the controller).
++        mPoseBlendPoses.clear();
++        for (const auto& [bone, world] : worldPoses)
++        {
++            const auto found = getNodeMap().find(bone);
++            if (found == getNodeMap().end())
++                continue;
++            setBoneWorldMatrix(bone, world);
++            if (!mPoseBlendPoses.empty())
++            {
++                mPoseBlendPoses.emplace_back(bone, osg::Matrixf(found->second->getMatrix()));
++                continue;
++            }
++            osg::NodePathList paths = found->second->getParentalNodePaths();
++            if (paths.empty())
++                return;
++            osg::NodePath& path = paths.front();
++            const auto base = std::find(path.begin(), path.end(), mInsert.get());
++            if (base == path.end())
++                return;
++            mPoseBlendPoses.emplace_back(bone, osg::Matrixf(osg::computeLocalToWorld(osg::NodePath(base + 1, path.end()))));
++        }
 +        osg::ref_ptr<PoseBlendState> state = new PoseBlendState;
 +        state->mWeight = 1;
 +        mPoseBlend = state;
-+        mPoseBlendPoses = worldPoses;
 +        mPoseBlendTime = seconds;
 +        mPoseBlendLeft = seconds;
 +        addPoseBlendControllers();
++    }
++
++    void Animation::cancelPoseBlend()
++    {
++        if (mPoseBlend != nullptr)
++            static_cast<PoseBlendState*>(mPoseBlend.get())->mWeight = 0;
++        mPoseBlend = nullptr;
++        mPoseBlendPoses.clear();
 +    }
 +
 +    void Animation::addPoseBlendControllers()
@@ -8111,14 +8207,15 @@ index 492030577..8026d4769 100644
 +        if (mPoseBlend == nullptr)
 +            return;
 +        auto* state = static_cast<PoseBlendState*>(mPoseBlend.get());
-+        for (const auto& [bone, world] : mPoseBlendPoses)
++        bool first = true;
++        for (const auto& [bone, pose] : mPoseBlendPoses)
 +        {
-+            if (bone.empty())
-+                continue;
 +            const auto found = getNodeMap().find(bone);
 +            if (found == getNodeMap().end())
 +                continue;
-+            osg::ref_ptr<osg::Callback> controller = new PoseBlendController(state, world);
++            osg::ref_ptr<osg::Callback> controller
++                = new PoseBlendController(state, pose, first ? mInsert.get() : nullptr);
++            first = false;
 +            found->second->addUpdateCallback(controller);
 +            mActiveControllers.emplace_back(found->second, controller);
 +        }
@@ -8126,7 +8223,7 @@ index 492030577..8026d4769 100644
  
      osg::ref_ptr<RotateController> Animation::addRotateController(std::string_view bone)
 diff --git a/apps/openmw/mwrender/animation.hpp b/apps/openmw/mwrender/animation.hpp
-index 7111d3df1..cbb295524 100644
+index 7111d3df1..c4c9419f1 100644
 --- a/apps/openmw/mwrender/animation.hpp
 +++ b/apps/openmw/mwrender/animation.hpp
 @@ -17,6 +17,10 @@
@@ -8168,7 +8265,7 @@ index 7111d3df1..cbb295524 100644
          float mHeadYawRadians;
          float mHeadPitchRadians;
          float mUpperBodyYawRadians;
-@@ -449,6 +467,90 @@ namespace MWRender
+@@ -449,6 +467,92 @@ namespace MWRender
          /// @note The matching is case-insensitive.
          const osg::Node* getNode(std::string_view name) const;
  
@@ -8203,6 +8300,8 @@ index 7111d3df1..cbb295524 100644
 +        std::vector<LockedPlay> mLockedPlays;
 +        /// @param replay play what was asked meanwhile (the important, or the recent)
 +        void setPoseLocked(bool locked, bool replay = true);
++        /// Ends the blend from a body's pose (blendFromPose) at once.
++        void cancelPoseBlend();
 +        /// The highest priority asked to play while locked (-1: nothing).
 +        int getLockedPlayPriority() const;
 +        /// The highest priority playing now (-1: nothing), the weather's aside.
