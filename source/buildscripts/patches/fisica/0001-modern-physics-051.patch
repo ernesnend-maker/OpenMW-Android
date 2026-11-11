@@ -838,7 +838,7 @@ index 61a148b7e..e778a172d 100644
          ++mDeathCount[actor.getCellRef().getRefId()];
  
 diff --git a/apps/openmw/mwmechanics/character.cpp b/apps/openmw/mwmechanics/character.cpp
-index 664f293fb..88458c127 100644
+index 664f293fb..27d1a41ed 100644
 --- a/apps/openmw/mwmechanics/character.cpp
 +++ b/apps/openmw/mwmechanics/character.cpp
 @@ -50,7 +50,9 @@
@@ -1420,7 +1420,7 @@ index 664f293fb..88458c127 100644
 +                getUpFromRagdoll(poses);
 +            }
 +        }
-+        else if (mDelirium->getCalmTime() > 0.45f || mDelirium->getAge() > 15.f)
++        else if (mDelirium->getCalmTime() > 0.2f || mDelirium->canLetGo() || mDelirium->getAge() > 15.f)
 +        {
 +            deliriumEvent(name + ": se recupera de pie");
 +            endDeliriumBody();
@@ -1449,7 +1449,7 @@ index 664f293fb..88458c127 100644
 +        // Back to its animation from the pose it was left in, facing the way the body turned.
 +        const ESM::Position& pos = mPtr.getRefData().getPosition();
 +        world->rotateObject(mPtr, osg::Vec3f(pos.rot[0], pos.rot[1], std::atan2(facing.x(), facing.y())));
-+        mAnimation->blendFromPose(poses, 0.35f);
++        mAnimation->blendFromPose(poses, 0.4f);
 +    }
 +
 +    void CharacterController::updateLiveRagdoll(float duration)
@@ -2185,10 +2185,10 @@ index 000000000..04528c771
 +};
 diff --git a/apps/openmw/mwmechanics/deliriumbody.cpp b/apps/openmw/mwmechanics/deliriumbody.cpp
 new file mode 100644
-index 000000000..ddd68c07a
+index 000000000..f50ad2822
 --- /dev/null
 +++ b/apps/openmw/mwmechanics/deliriumbody.cpp
-@@ -0,0 +1,745 @@
+@@ -0,0 +1,748 @@
 +#include "deliriumbody.hpp"
 +
 +#include <algorithm>
@@ -2732,7 +2732,9 @@ index 000000000..ddd68c07a
 +            nm_msg_send(mAgent, mWorld);
 +        }
 +        const bool writhing = mWritheUntil >= 0 || mWritheUntil == -2;
-+        mCalm = (!mDown && balancing && !fallen && energy < 2.f && mSincePush > 0.6f) ? mCalm + dt : 0.f;
++        mCalm = (!mDown && balancing && !fallen && energy < 4.f && mSincePush > 0.35f) ? mCalm + dt : 0.f;
++        mCanLetGo = !mDown && !mDying && balancing && !fallen && mSincePush > mHold && head[2] > 1.25f
++            && head[2] - pelvis[2] > 0.45f;
 +        mStill = (mDown && energy < 1.5f && !writhing) ? mStill + dt : 0.f;
 +    }
 +
@@ -2795,6 +2797,7 @@ index 000000000..ddd68c07a
 +        const float p[3] = { at.x, at.y, at.z };
 +        const float i[3] = { direction.x * impulse, direction.y * impulse, direction.z * impulse };
 +        nm_agent_apply_push(mAgent, p, i);
++        mHold = std::clamp(0.4f + impulse / 220.f, 0.5f, 1.8f);
 +        mSincePush = 0;
 +        mCalm = 0;
 +        mStill = 0;
@@ -2936,10 +2939,10 @@ index 000000000..ddd68c07a
 +}
 diff --git a/apps/openmw/mwmechanics/deliriumbody.hpp b/apps/openmw/mwmechanics/deliriumbody.hpp
 new file mode 100644
-index 000000000..7d9b1e794
+index 000000000..76a624b2d
 --- /dev/null
 +++ b/apps/openmw/mwmechanics/deliriumbody.hpp
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,148 @@
 +#ifndef OPENMW_MWMECHANICS_DELIRIUMBODY_H
 +#define OPENMW_MWMECHANICS_DELIRIUMBODY_H
 +
@@ -3021,6 +3024,9 @@ index 000000000..7d9b1e794
 +        float getDownTime() const { return mDown ? mAge - mDownAt : 0.f; }
 +        /// On its feet again and steady for this long (seconds).
 +        float getCalmTime() const { return mCalm; }
++        /// On its feet and holding, long enough after the last blow for its size: the animation (and whoever drives
++        /// the actor: its AI, a mod's) can have it back, as after the engine's own hit animation.
++        bool canLetGo() const { return mCanLetGo; }
 +        /// Lying still for this long (seconds).
 +        float getStillTime() const { return mStill; }
 +        float getAge() const { return mAge; }
@@ -3078,6 +3084,8 @@ index 000000000..7d9b1e794
 +        float mWritheFor = 0;
 +        float mWritheUntil = -1;
 +        bool mBroken = false;
++        bool mCanLetGo = false;
++        float mHold = 0.5f; // seconds a blow keeps the body (by its push)
 +        bool mBeast = false;
 +    };
 +}
