@@ -838,7 +838,7 @@ index 61a148b7e..e778a172d 100644
          ++mDeathCount[actor.getCellRef().getRefId()];
  
 diff --git a/apps/openmw/mwmechanics/character.cpp b/apps/openmw/mwmechanics/character.cpp
-index 664f293fb..27d1a41ed 100644
+index 664f293fb..8db5c09f9 100644
 --- a/apps/openmw/mwmechanics/character.cpp
 +++ b/apps/openmw/mwmechanics/character.cpp
 @@ -50,7 +50,9 @@
@@ -967,7 +967,7 @@ index 664f293fb..27d1a41ed 100644
 +        {
 +            mDelirium.reset();
 +            if (mAnimation != nullptr)
-+                mAnimation->setPoseLocked(false);
++                mAnimation->setPoseLocked(false, !mPtr.getClass().getCreatureStats(mPtr).isDead());
 +        }
 +        if (mRagdoll)
 +        {
@@ -979,7 +979,7 @@ index 664f293fb..27d1a41ed 100644
          if (mDeathState == CharState_None)
              return;
  
-@@ -2805,6 +2883,685 @@ namespace MWMechanics
+@@ -2805,6 +2883,698 @@ namespace MWMechanics
          mWeaponType = ESM::Weapon::None;
      }
  
@@ -1125,6 +1125,12 @@ index 664f293fb..27d1a41ed 100644
 +                fall = true;
 +            if (!hasHit && !fall)
 +                return mDelirium != nullptr;
++            if (mDelirium == nullptr && !fall && mAnimation->getHighestPlayingPriority() >= Priority_Storm)
++            {
++                // In the middle of something that goes over a hit (a mod's surrender): left alone, as the engine would.
++                deliriumEvent(name + ": nada (animacion prioritaria en curso)");
++                return false;
++            }
 +            if (mDelirium == nullptr)
 +            {
 +                MWBase::World* world = MWBase::Environment::get().getWorld();
@@ -1384,6 +1390,13 @@ index 664f293fb..27d1a41ed 100644
 +        MWBase::World* world = MWBase::Environment::get().getWorld();
 +        CreatureStats& stats = mPtr.getClass().getCreatureStats(mPtr);
 +        const std::string name(mPtr.getClass().getName(mPtr));
++        // A mod asks for an animation that goes over even a knockdown's (a surrender): on its feet, it has the body.
++        if (!mDelirium->isDown() && mAnimation->getLockedPlayPriority() > Priority_Knockdown)
++        {
++            deliriumEvent(name + ": cede el cuerpo a una animacion");
++            endDeliriumBody();
++            return;
++        }
 +        mDelirium->step(duration);
 +        if (mDelirium->isBroken())
 +        {
@@ -1415,7 +1428,7 @@ index 664f293fb..27d1a41ed 100644
 +                {
 +            mDelirium.reset();
 +            if (mAnimation != nullptr)
-+                mAnimation->setPoseLocked(false);
++                mAnimation->setPoseLocked(false, !mPtr.getClass().getCreatureStats(mPtr).isDead());
 +        }
 +                getUpFromRagdoll(poses);
 +            }
@@ -1438,7 +1451,7 @@ index 664f293fb..27d1a41ed 100644
 +        {
 +            mDelirium.reset();
 +            if (mAnimation != nullptr)
-+                mAnimation->setPoseLocked(false);
++                mAnimation->setPoseLocked(false, !mPtr.getClass().getCreatureStats(mPtr).isDead());
 +        }
 +        world->setActorCollisionMode(mPtr, true, true);
 +        if (down)
@@ -1588,7 +1601,7 @@ index 664f293fb..27d1a41ed 100644
 +                {
 +            mDelirium.reset();
 +            if (mAnimation != nullptr)
-+                mAnimation->setPoseLocked(false);
++                mAnimation->setPoseLocked(false, !mPtr.getClass().getCreatureStats(mPtr).isDead());
 +        }
 +                MWBase::Environment::get().getWorld()->makeRagdoll(mPtr, osg::Vec3f(), false, !broken);
 +            }
@@ -7480,16 +7493,17 @@ index 000000000..1804206d7
 +
 +#endif
 diff --git a/apps/openmw/mwrender/animation.cpp b/apps/openmw/mwrender/animation.cpp
-index 492030577..0105b7cfd 100644
+index 492030577..8026d4769 100644
 --- a/apps/openmw/mwrender/animation.cpp
 +++ b/apps/openmw/mwrender/animation.cpp
-@@ -3,13 +3,19 @@
+@@ -3,13 +3,20 @@
  #include <algorithm>
  #include <iomanip>
  #include <limits>
 +#include <set>
  
  #include <osg/BlendFunc>
++#include <osg/Timer>
 +#include <osg/ComputeBoundsVisitor>
  #include <osg/LightModel>
  #include <osg/Material>
@@ -7503,7 +7517,7 @@ index 492030577..0105b7cfd 100644
  #include <osgParticle/ParticleProcessor>
  #include <osgParticle/ParticleSystem>
  
-@@ -17,6 +23,8 @@
+@@ -17,6 +24,8 @@
  #include <osgAnimation/UpdateBone>
  
  #include <components/debug/debuglog.hpp>
@@ -7512,7 +7526,7 @@ index 492030577..0105b7cfd 100644
  
  #include <components/resource/animblendrulesmanager.hpp>
  #include <components/resource/keyframemanager.hpp>
-@@ -58,6 +66,7 @@
+@@ -58,6 +67,7 @@
  #include "../mwworld/esmstore.hpp"
  
  #include "../mwmechanics/character.hpp" // FIXME: for MWMechanics::Priority
@@ -7520,17 +7534,37 @@ index 492030577..0105b7cfd 100644
  #include "../mwmechanics/weapontype.hpp"
  
  #include "actorutil.hpp"
-@@ -887,6 +896,9 @@ namespace MWRender
+@@ -887,6 +897,29 @@ namespace MWRender
          float speedmult, std::string_view start, std::string_view stop, float startpoint, uint32_t loops,
          bool loopfallback)
      {
 +        // Fisica: a physical body has the bones (Delirium); nobody's animation gets in.
 +        if (mPoseLocked)
++        {
++            if (groupname.empty() || !hasAnimation(groupname))
++                return;
++            std::erase_if(mLockedPlays, [&](const LockedPlay& asked) { return asked.mGroup == groupname; });
++            if (mLockedPlays.size() >= 6)
++                mLockedPlays.erase(mLockedPlays.begin());
++            LockedPlay asked;
++            asked.mGroup = std::string(groupname);
++            asked.mPriority = priority;
++            asked.mBlendMask = blendMask;
++            asked.mAutoDisable = autodisable;
++            asked.mSpeed = speedmult;
++            asked.mStart = std::string(start);
++            asked.mStop = std::string(stop);
++            asked.mStartPoint = startpoint;
++            asked.mLoops = loops;
++            asked.mLoopFallback = loopfallback;
++            asked.mTime = osg::Timer::instance()->time_s();
++            mLockedPlays.push_back(std::move(asked));
 +            return;
++        }
          if (!mObjectRoot || mAnimSources.empty())
              return;
  
-@@ -1050,6 +1062,354 @@ namespace MWRender
+@@ -1050,6 +1083,354 @@ namespace MWRender
          mTextKeyListener = listener;
      }
  
@@ -7885,7 +7919,65 @@ index 492030577..0105b7cfd 100644
      const Animation::NodeMap& Animation::getNodeMap() const
      {
          if (!mNodeMapCreated && mObjectRoot)
-@@ -1337,8 +1697,72 @@ namespace MWRender
+@@ -1258,8 +1639,57 @@ namespace MWRender
+         return iter->second.getTime();
+     }
+ 
++    namespace
++    {
++        int highest(const AnimPriority& priority)
++        {
++            int value = -1;
++            for (unsigned int i = 0; i < sNumBlendMasks; ++i)
++                value = std::max(value, priority.mPriority[i]);
++            return value;
++        }
++    }
++
++    void Animation::setPoseLocked(bool locked, bool replay)
++    {
++        mPoseLocked = locked;
++        if (locked)
++            return;
++        std::vector<LockedPlay> plays;
++        plays.swap(mLockedPlays);
++        if (!replay)
++            return;
++        const double now = osg::Timer::instance()->time_s();
++        for (const LockedPlay& asked : plays)
++        {
++            // Over a knockdown's priority (a surrender): always. The rest (an attack, an idle) only if just asked.
++            if (highest(asked.mPriority) < 9 && now - asked.mTime > 1.0)
++                continue;
++            play(asked.mGroup, asked.mPriority, asked.mBlendMask, asked.mAutoDisable, asked.mSpeed, asked.mStart,
++                asked.mStop, asked.mStartPoint, asked.mLoops, asked.mLoopFallback);
++        }
++    }
++
++    int Animation::getLockedPlayPriority() const
++    {
++        int value = -1;
++        for (const LockedPlay& asked : mLockedPlays)
++            value = std::max(value, highest(asked.mPriority));
++        return value;
++    }
++
++    int Animation::getHighestPlayingPriority() const
++    {
++        int value = -1;
++        for (const auto& [group, state] : mStates)
++            if (group != "idlestorm")
++                value = std::max(value, highest(state.mPriority));
++        return value;
++    }
++
+     void Animation::disable(std::string_view groupname)
+     {
++        std::erase_if(mLockedPlays, [&](const LockedPlay& asked) { return asked.mGroup == groupname; });
+         AnimStateMap::iterator iter = mStates.find(groupname);
+         if (iter != mStates.end())
+         {
+@@ -1337,8 +1767,72 @@ namespace MWRender
          position += off - osg::componentMultiply(mAccumCtrl->getTranslation(oldtime), mAccumulate);
      }
  
@@ -7958,7 +8050,7 @@ index 492030577..0105b7cfd 100644
          osg::Vec3f movement(0.f, 0.f, 0.f);
          AnimStateMap::iterator stateiter = mStates.begin();
          while (stateiter != mStates.end())
-@@ -1659,6 +2083,10 @@ namespace MWRender
+@@ -1659,6 +2153,10 @@ namespace MWRender
          mObjectRoot->addCullCallback(mLightListCallback);
          if (mTransparencyUpdater)
              mObjectRoot->addCullCallback(mTransparencyUpdater);
@@ -7969,7 +8061,7 @@ index 492030577..0105b7cfd 100644
      }
  
      osg::Group* Animation::getObjectRoot()
-@@ -1931,6 +2359,63 @@ namespace MWRender
+@@ -1931,6 +2429,63 @@ namespace MWRender
          mHeadController = addRotateController("bip01 head");
          mSpineController = addRotateController("bip01 spine1");
          mRootController = addRotateController("bip01");
@@ -8034,7 +8126,7 @@ index 492030577..0105b7cfd 100644
  
      osg::ref_ptr<RotateController> Animation::addRotateController(std::string_view bone)
 diff --git a/apps/openmw/mwrender/animation.hpp b/apps/openmw/mwrender/animation.hpp
-index 7111d3df1..cb68a7f10 100644
+index 7111d3df1..cbb295524 100644
 --- a/apps/openmw/mwrender/animation.hpp
 +++ b/apps/openmw/mwrender/animation.hpp
 @@ -17,6 +17,10 @@
@@ -8076,7 +8168,7 @@ index 7111d3df1..cb68a7f10 100644
          float mHeadYawRadians;
          float mHeadPitchRadians;
          float mUpperBodyYawRadians;
-@@ -449,6 +467,69 @@ namespace MWRender
+@@ -449,6 +467,90 @@ namespace MWRender
          /// @note The matching is case-insensitive.
          const osg::Node* getNode(std::string_view name) const;
  
@@ -8093,7 +8185,28 @@ index 7111d3df1..cb68a7f10 100644
 +        /// Fisica (Delirium): is any animation group playing (one a mod started over a ragdoll, say)?
 +        /// Fisica: while set, play() does nothing (a physical body has the bones).
 +        bool mPoseLocked = false;
-+        void setPoseLocked(bool locked) { mPoseLocked = locked; }
++        // What was asked to play meanwhile (a mod's surrender, an attack): played when the body is given back.
++        struct LockedPlay
++        {
++            std::string mGroup;
++            AnimPriority mPriority{ 0 };
++            int mBlendMask = 0;
++            bool mAutoDisable = true;
++            float mSpeed = 1;
++            std::string mStart;
++            std::string mStop;
++            float mStartPoint = 0;
++            uint32_t mLoops = 0;
++            bool mLoopFallback = false;
++            double mTime = 0;
++        };
++        std::vector<LockedPlay> mLockedPlays;
++        /// @param replay play what was asked meanwhile (the important, or the recent)
++        void setPoseLocked(bool locked, bool replay = true);
++        /// The highest priority asked to play while locked (-1: nothing).
++        int getLockedPlayPriority() const;
++        /// The highest priority playing now (-1: nothing), the weather's aside.
++        int getHighestPlayingPriority() const;
 +        bool isPoseLocked() const { return mPoseLocked; }
 +        bool hasActiveAnimations() const { return !mStates.empty(); }
 +        void setBoneWorldMatrix(std::string_view bone, const osg::Matrixf& world);
